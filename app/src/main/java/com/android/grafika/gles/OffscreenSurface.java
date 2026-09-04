@@ -17,22 +17,22 @@
 package com.android.grafika.gles;
 
 /**
- * Off-screen EGL surface (pbuffer).
- * <p>
- * It's good practice to explicitly release() the surface, preferably from a "finally" block.
+ * 离屏 EGLSurface（Pbuffer）的便捷封装。
+ *
+ * <p>Pbuffer 没有对应的 Android 窗口，不会直接显示到屏幕。它可以作为当前绘制目标，
+ * 用于创建 GL 对象、执行离屏渲染、读取像素或做性能测试。与窗口 surface 一样，使用前
+ * 需要调用 {@link #makeCurrent()}。</p>
+ *
+ * <p>建议显式调用 {@link #release()}，最好放在 finally 代码块中。</p>
  */
 public class OffscreenSurface extends EglSurfaceBase {
-    /**
-     * Creates an off-screen surface with the specified width and height.
-     */
+    /** 创建指定像素尺寸的离屏 Pbuffer。 */
     public OffscreenSurface(EglCore eglCore, int width, int height) {
         super(eglCore);
         createOffscreenSurface(width, height);
     }
 
-    /**
-     * Releases any resources associated with the surface.
-     */
+    /** 释放底层 EGLSurface。 */
     public void release() {
         releaseEglSurface();
     }

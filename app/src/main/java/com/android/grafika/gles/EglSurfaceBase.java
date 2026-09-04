@@ -30,28 +30,42 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 
 /**
- * Common base class for EGL surfaces.
- * <p>
- * There can be multiple surfaces associated with a single context.
+ * EGLSurface 的通用封装基类。
+ *
+ * <p>一个 {@link EglCore} 可以关联多个 EGLSurface，例如一个窗口 surface 用于显示，
+ * 另一个窗口 surface 连接 MediaCodec，或者一个 Pbuffer 用于离屏渲染。本类把这些 surface
+ * 的创建、尺寸查询、current 切换、交换缓冲区和截图操作统一起来。</p>
+ *
+ * <p>本类不持有 Android {@link android.view.Surface} 的所有权；具体的资源释放策略由
+ * {@link WindowSurface} 和 {@link OffscreenSurface} 决定。</p>
  */
 public class EglSurfaceBase {
+    /** 日志标签。 */
     protected static final String TAG = GlUtil.TAG;
 
-    // EglCore object we're associated with.  It may be associated with multiple surfaces.
+    /** 所属的 EGL 核心对象；同一个 EglCore 可以服务多个 EGLSurface。 */
     protected EglCore mEglCore;
 
+    /** 当前封装的底层 EGLSurface；NO_SURFACE 表示尚未创建或已经释放。 */
     private EGLSurface mEGLSurface = EGL14.EGL_NO_SURFACE;
+    /** 缓存的宽度；窗口 surface 使用 -1，表示每次从 EGL 查询。 */
     private int mWidth = -1;
+    /** 缓存的高度；窗口 surface 使用 -1，表示每次从 EGL 查询。 */
     private int mHeight = -1;
 
+    /** 由子类调用，关联一个已经初始化好的 EglCore。 */
     protected EglSurfaceBase(EglCore eglCore) {
         mEglCore = eglCore;
     }
 
     /**
-     * Creates a window surface.
-     * <p>
-     * @param surface May be a Surface or SurfaceTexture.
+     * 创建窗口型 EGLSurface。
+     *
+     * <p>窗口底层可以是 {@link android.view.Surface} 或 {@link android.graphics.SurfaceTexture}。
+     * 窗口尺寸可能在运行时变化，因此这里不缓存尺寸，而是在 {@link #getWidth()} 和
+     * {@link #getHeight()} 中动态查询。</p>
+     *
+     * @param surface Android Surface 或 SurfaceTexture
      */
     public void createWindowSurface(Object surface) {
         if (mEGLSurface != EGL14.EGL_NO_SURFACE) {
@@ -59,15 +73,12 @@ public class EglSurfaceBase {
         }
         mEGLSurface = mEglCore.createWindowSurface(surface);
 
-        // Don't cache width/height here, because the size of the underlying surface can change
-        // out from under us (see e.g. HardwareScalerActivity).
+        // 不缓存窗口宽高，因为底层窗口可能异步改变尺寸；动态查询才能观察到最新值。
         //mWidth = mEglCore.querySurface(mEGLSurface, EGL14.EGL_WIDTH);
         //mHeight = mEglCore.querySurface(mEGLSurface, EGL14.EGL_HEIGHT);
     }
 
-    /**
-     * Creates an off-screen surface.
-     */
+    /** 创建指定大小的离屏 Pbuffer，并缓存其固定宽高。 */
     public void createOffscreenSurface(int width, int height) {
         if (mEGLSurface != EGL14.EGL_NO_SURFACE) {
             throw new IllegalStateException("surface already created");
@@ -78,11 +89,10 @@ public class EglSurfaceBase {
     }
 
     /**
-     * Returns the surface's width, in pixels.
-     * <p>
-     * If this is called on a window surface, and the underlying surface is in the process
-     * of changing size, we may not see the new size right away (e.g. in the "surfaceChanged"
-     * callback).  The size should match after the next buffer swap.
+     * 返回 EGLSurface 宽度，单位为像素。
+     *
+     * <p>窗口 surface 的尺寸由底层 Android Surface 决定，可能在 surfaceChanged 回调期间
+     * 仍处于更新过程中；Pbuffer 的尺寸则是创建时指定的固定值。</p>
      */
     public int getWidth() {
         if (mWidth < 0) {
@@ -92,9 +102,7 @@ public class EglSurfaceBase {
         }
     }
 
-    /**
-     * Returns the surface's height, in pixels.
-     */
+    /** 返回 EGLSurface 高度，单位为像素。 */
     public int getHeight() {
         if (mHeight < 0) {
             return mEglCore.querySurface(mEGLSurface, EGL14.EGL_HEIGHT);
@@ -103,34 +111,32 @@ public class EglSurfaceBase {
         }
     }
 
-    /**
-     * Release the EGL surface.
-     */
+    /** 释放底层 EGLSurface，并清除尺寸缓存；不负责释放 Android Surface 对象。 */
     public void releaseEglSurface() {
         mEglCore.releaseSurface(mEGLSurface);
         mEGLSurface = EGL14.EGL_NO_SURFACE;
         mWidth = mHeight = -1;
     }
 
-    /**
-     * Makes our EGL context and surface current.
-     */
+    /** 将所属 EglCore 的 context 和当前 surface 绑定到调用线程。 */
     public void makeCurrent() {
         mEglCore.makeCurrent(mEGLSurface);
     }
 
     /**
-     * Makes our EGL context and surface current for drawing, using the supplied surface
-     * for reading.
+     * 将当前 surface 作为绘制目标，同时把另一个 surface 作为读取目标绑定到当前线程。
+     *
+     * <p>这种读写分离模式主要用于 EGL 的跨 surface 操作；普通绘制调用 {@link #makeCurrent()}
+     * 即可。</p>
      */
     public void makeCurrentReadFrom(EglSurfaceBase readSurface) {
         mEglCore.makeCurrent(mEGLSurface, readSurface.mEGLSurface);
     }
 
     /**
-     * Calls eglSwapBuffers.  Use this to "publish" the current frame.
+     * 交换 EGLSurface 的前后缓冲区，把当前帧发布到窗口或编码器。
      *
-     * @return false on failure
+     * @return {@code true} 表示成功，{@code false} 表示 EGL 报告失败
      */
     public boolean swapBuffers() {
         boolean result = mEglCore.swapBuffers(mEGLSurface);
@@ -141,35 +147,33 @@ public class EglSurfaceBase {
     }
 
     /**
-     * Sends the presentation time stamp to EGL.
+     * 设置当前 EGLSurface 的帧呈现时间戳。
      *
-     * @param nsecs Timestamp, in nanoseconds.
+     * @param nsecs 时间戳，单位为纳秒
      */
     public void setPresentationTime(long nsecs) {
         mEglCore.setPresentationTime(mEGLSurface, nsecs);
     }
 
     /**
-     * Saves the EGL surface to a file.
-     * <p>
-     * Expects that this object's EGL surface is current.
+     * 读取当前 EGLSurface 的像素并保存为 PNG 文件。
+     *
+     * <p>调用前必须保证本对象的 EGLSurface 是 current。实现通过 {@code glReadPixels()} 从
+     * 左下角开始读取 RGBA 字节，再交给 Android Bitmap 编码。OpenGL 的坐标原点通常在左下角，
+     * 而图像坐标习惯上从左上角开始，因此截图方向可能与屏幕显示方向相反，这是理解截图结果
+     * 时需要注意的点。</p>
+     *
+     * @param file 输出 PNG 文件
+     * @throws IOException 创建或写入文件失败
      */
     public void saveFrame(File file) throws IOException {
         if (!mEglCore.isCurrent(mEGLSurface)) {
             throw new RuntimeException("Expected EGL context/surface is not current");
         }
 
-        // glReadPixels fills in a "direct" ByteBuffer with what is essentially big-endian RGBA
-        // data (i.e. a byte of red, followed by a byte of green...).  While the Bitmap
-        // constructor that takes an int[] wants little-endian ARGB (blue/red swapped), the
-        // Bitmap "copy pixels" method wants the same format GL provides.
-        //
-        // Ideally we'd have some way to re-use the ByteBuffer, especially if we're calling
-        // here often.
-        //
-        // Making this even more interesting is the upside-down nature of GL, which means
-        // our output will look upside down relative to what appears on screen if the
-        // typical GL conventions are used.
+        // glReadPixels() 写入的是连续的 RGBA 字节。这里使用 direct ByteBuffer，既满足 GLES
+        // 对 native buffer 的要求，也可以直接交给 Bitmap.copyPixelsFromBuffer()。
+        // 注意 GL 的像素行从底部开始，因此输出 PNG 可能上下颠倒；本工具类不额外翻转行。
 
         String filename = file.toString();
 
