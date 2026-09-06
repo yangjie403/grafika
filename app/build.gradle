@@ -20,8 +20,8 @@ android {
   compileSdk = 35
   defaultConfig {
     applicationId = "com.google.grafika"
-    minSdk = 14
-    targetSdk = 28
+    minSdk = 24
+    targetSdk = 30
   }
 }
 
