@@ -47,7 +47,7 @@ Grafika 会根据实际需求逐步增加功能，很多功能源于开发者对
 Activity 实现与技术点
 ---------------------
 
-项目中共有 22 个 Activity。`MainActivity` 通过排序列表展示大多数入口，名称带有
+项目中共有 23 个 Activity。`MainActivity` 通过排序列表展示大多数入口，名称带有
 `{~ignore}` 前缀的是默认隐藏的诊断实验。下面的清单基于当前源码和 Manifest 注册项整理。
 
 ```
@@ -75,6 +75,9 @@ com/android/grafika/
 │   ├── RecordFBOActivity.java          # 核心：FBO 离屏渲染 + 屏幕/录制双输出
 │   └── TextureViewGLActivity.java      # 自定义 GL 线程渲染到 TextureView
 │
+├── OpenGL ES 入门示例
+│   └── OpenGlesTriangleActivity.java   # GLSurfaceView + GLES 2.0 绘制彩色三角形
+│
 └── 其他辅助/旧版 API 演示（可跳过）
     ├── CameraCaptureActivity.java      # Camera1 预览与录制
     ├── ContinuousCaptureActivity.java  # 环形缓冲区录制
@@ -97,6 +100,7 @@ com/android/grafika/
 | [`ScheduledSwapActivity`](app/src/main/java/com/android/grafika/ScheduledSwapActivity.java) | 测试向 SurfaceFlinger 提交指定未来显示时间的缓冲区。 | API 19 时间戳呈现、`Choreographer`、`WindowSurface.setPresentationTime()`、3-2 Pulldown/更新模式、提前多帧调度、`Trace`/systrace 诊断和丢帧统计。 |
 | [`MultiSurfaceActivity`](app/src/main/java/com/android/grafika/MultiSurfaceActivity.java) | 展示三个重叠的 Surface 图层，其中包含安全图层和动画图层。 | `SurfaceView.setSecure()`、Media Overlay 和顶层 Z 顺序、半透明 RGBA Surface、Canvas/GLES 绘制、Alpha 混合、`PorterDuff`、合成器及截屏/录屏行为。 |
 | [`TextureViewGLActivity`](app/src/main/java/com/android/grafika/TextureViewGLActivity.java) | 将持续运动的 GL 方块绘制到 `TextureView`。 | 手动管理渲染线程、由 `SurfaceTexture` 支撑的 EGL `WindowSurface`、GLES 2/3、Scissor 渲染、SurfaceTexture 生产者/消费者流程、不等待垂直同步的高速渲染。 |
+| [`OpenGlesTriangleActivity`](app/src/main/java/com/android/grafika/OpenGlesTriangleActivity.java) | 使用 `GLSurfaceView` 和 OpenGL ES 2.0 绘制彩色三角形，作为 GLES 入门示例。 | Renderer 生命周期、GL 渲染线程、EGLSurface、vertex/fragment shader、shader 编译与 program 链接、`FloatBuffer`、交错顶点属性、viewport、`glDrawArrays()` 和 GL 错误检查。 |
 | [`TextureViewCanvasActivity`](app/src/main/java/com/android/grafika/TextureViewCanvasActivity.java) | 使用软件 Canvas 将动画场景绘制到 `TextureView`。 | 渲染线程同步、`Surface.lockCanvas()`/`unlockCanvasAndPost()`、脏矩形实验、SurfaceTexture 回调，以及与 GL 渲染的对比。 |
 | [`TextureFromCameraActivity`](app/src/main/java/com/android/grafika/TextureFromCameraActivity.java) | 将摄像头预览作为 GLES 纹理显示，并支持缩放、旋转、调整尺寸和触摸定位。 | 专用摄像头/渲染线程、外部纹理、`SurfaceView`、`SeekBar` 参数映射、触摸事件、Sprite 几何与矩阵、Handler 消息传递、Surface 暂停/恢复处理。 |
 | [`ColorBarActivity`](app/src/main/java/com/android/grafika/ColorBarActivity.java) | 显示带文字标签的 RGB 彩条和 Alpha 覆盖层。 | `SurfaceView`、RGBA8888 缓冲区格式、软件 `Canvas`、`Surface.lockCanvas()`、`Paint`/`Typeface` 文字绘制、Surface 回调。 |

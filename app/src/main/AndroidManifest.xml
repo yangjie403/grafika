@@ -64,6 +64,10 @@
             android:label="@string/title_activity_texture_view_canvas" >
         </activity>
         <activity
+            android:name="com.android.grafika.OpenGlesTriangleActivity"
+            android:label="@string/title_activity_opengles_triangle" >
+        </activity>
+        <activity
             android:name="com.android.grafika.RecordFBOActivity"
             android:label="@string/title_activity_record_fbo"
             android:theme="@android:style/Theme.NoTitleBar.Fullscreen" >

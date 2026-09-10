@@ -49,6 +49,38 @@ import java.io.IOException;
 import java.lang.ref.WeakReference;
 
 /**
+ * 本类是一个“OpenGL ES 屏幕显示 + 视频录制”的完整示例。
+ *
+ * <p>录制内容只有 SurfaceView 中的 GL 画面，不包含 Activity 的按钮、状态栏、导航栏或
+ * 弹窗。当前类负责 EGL/GL 绘制以及把图像提交到编码器输入 Surface；
+ * {@link TextureMovieEncoder2} 在独立线程中排空 MediaCodec 输出，
+ * {@link VideoEncoderCore} 再使用 MediaMuxer 将编码数据封装成 MP4。</p>
+ *
+ * <p>本类故意使用普通 SurfaceView，而不是 GLSurfaceView，这样可以自行控制 EGL 配置、
+ * EGLSurface 切换、渲染线程和资源释放顺序。EGL 会尝试创建 GLES 3 上下文；如果设备
+ * 支持 GLES 3，就可以使用 glBlitFramebuffer()，把屏幕 framebuffer 的内容复制到编码器
+ * Surface，减少一次重新绘制。</p>
+ *
+ * <p>Choreographer 在 UI 线程上提供接近 VSYNC 的回调，渲染线程只接收时间戳并执行真正
+ * 的绘制。这样动画与显示刷新节奏同步，同时不会把 EGL、GL 和编码输入等较重工作放在
+ * UI 线程上。本例没有让渲染线程直接接收 Choreographer 回调，而是由 UI 线程接收后
+ * 通过 Handler 转发，以避免某些平台实现产生持久 JNI 引用、延长 Activity 生命周期。</p>
+ *
+ * <p>录制路径有三种：重复绘制、FBO 离屏纹理，以及 GLES 3 的 framebuffer blit。三者
+ * 都使用同一个 EGLContext：FBO 不能像普通纹理那样简单地跨上下文共享，而同一上下文
+ * 还可以直接在屏幕 framebuffer 与编码器 EGLSurface 之间切换。</p>
+ *
+ * <p>视频编码通常由硬件 H.264 编码器完成，CPU 主要承担 MediaCodec 输出排空和
+ * MediaMuxer 磁盘写入。因此编码线程只负责消费输出，渲染线程只通过输入 Surface 提交
+ * 图像，并通过 frameAvailableSoon() 提醒编码线程排空，从而降低编码器背压阻塞
+ * eglSwapBuffers() 的概率。</p>
+ *
+ * <p>学习本类时可以把一帧理解为：VSYNC 时间戳到达 → 更新动画 → 判断是否丢帧 → 绘制
+ * 屏幕 → 必要时把同一画面复制/绘制到编码器 → 设置 presentation timestamp → swapBuffers。
+ * Surface 销毁时则反向执行：停止消息输入 → 停止编码 → 删除 GL 资源 → 释放 EGL。</p>
+ *
+ * <p>下面保留了原项目的英文说明，便于对照 Android Grafika 原始实现。</p>
+ *
  * Demonstrates efficient display + recording of OpenGL rendering using an FBO.  This
  * records only the GL surface (i.e. not the app UI, nav bar, status bar, or alert dialog).
  * <p>
@@ -100,14 +132,21 @@ public class RecordFBOActivity extends Activity implements SurfaceHolder.Callbac
     // See the (lengthy) notes at the top of HardwareScalerActivity for thoughts about
     // Activity / Surface lifecycle management.
 
+    /** 直接绘制两次：一次绘制到屏幕，一次绘制到编码器输入 Surface。 */
     private static final int RECMETHOD_DRAW_TWICE = 0;
+    /** 默认策略：先绘制到离屏 FBO，再将颜色纹理绘制到两个输出。 */
     private static final int RECMETHOD_FBO = 1;
+    /** GLES 3 策略：先绘制到屏幕 framebuffer，再调用 glBlitFramebuffer() 复制。 */
     private static final int RECMETHOD_BLIT_FRAMEBUFFER = 2;
 
-    private boolean mRecordingEnabled = false;          // controls button state
-    private boolean mBlitFramebufferAllowed = false;    // requires GLES3
-    private int mSelectedRecordMethod;                  // current radio button
+    /** Activity 层的录制开关状态，同时用于更新按钮和状态文本。 */
+    private boolean mRecordingEnabled = false;
+    /** 当前 EGLContext 是否为 GLES 3；只有 GLES 3 才能使用 framebuffer blit。 */
+    private boolean mBlitFramebufferAllowed = false;
+    /** 用户在单选按钮中选择的录制策略。 */
+    private int mSelectedRecordMethod;
 
+    /** 持有 EGL/GL 状态的渲染线程；Surface 存在时创建，Surface 销毁时回收。 */
     private RenderThread mRenderThread;
 
     @Override
@@ -115,9 +154,12 @@ public class RecordFBOActivity extends Activity implements SurfaceHolder.Callbac
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_record_fbo);
 
+        // FBO 是默认策略。此时还不知道设备是否支持 GLES 3，稍后由渲染线程回传版本。
         mSelectedRecordMethod = RECMETHOD_FBO;
         updateControls();
 
+        // SurfaceView 的 Surface 是实际的屏幕绘制目标；回调会在 Surface 创建、尺寸变化和
+        // 销毁时通知 Activity。GL 资源不能在 Surface 销毁后继续使用。
         SurfaceView sv = (SurfaceView) findViewById(R.id.fboActivity_surfaceView);
         sv.getHolder().addCallback(this);
 
@@ -132,9 +174,8 @@ public class RecordFBOActivity extends Activity implements SurfaceHolder.Callbac
         //       which is pretty boring since we're not outputting any frames (test this
         //       by blanking the screen with the power button).
 
-        // If the callback was posted, remove it.  This stops the notifications.  Ideally we
-        // would send a message to the thread letting it know, so when it wakes up it can
-        // reset its notion of when the previous Choreographer event arrived.
+        // 移除已注册的 VSYNC 回调，停止继续向渲染线程投递帧消息。这里没有自动停止编码，
+        // 所以暂停期间只是“不再提交新帧”，已有编码线程仍可能继续等待或收尾。
         Log.d(TAG, "onPause unhooking choreographer");
         Choreographer.getInstance().removeFrameCallback(this);
     }
@@ -143,7 +184,7 @@ public class RecordFBOActivity extends Activity implements SurfaceHolder.Callbac
     protected void onResume() {
         super.onResume();
 
-        // If we already have a Surface, we just need to resume the frame notifications.
+        // 如果 Surface 尚未重建，渲染线程仍然存在，只需重新开始接收 VSYNC 通知。
         if (mRenderThread != null) {
             Log.d(TAG, "onResume re-hooking choreographer");
             Choreographer.getInstance().postFrameCallback(this);
@@ -156,12 +197,15 @@ public class RecordFBOActivity extends Activity implements SurfaceHolder.Callbac
     public void surfaceCreated(SurfaceHolder holder) {
         Log.d(TAG, "surfaceCreated holder=" + holder);
 
+        // 输出文件放到应用私有目录。Surface 创建后才启动渲染线程，避免线程在无效 Surface
+        // 上初始化 EGL window surface。
         File outputFile = new File(getFilesDir(), "fbo-gl-recording.mp4");
         SurfaceView sv = (SurfaceView) findViewById(R.id.fboActivity_surfaceView);
         mRenderThread = new RenderThread(sv.getHolder(), new ActivityHandler(this), outputFile,
                 MiscUtils.getDisplayRefreshNsec(this));
         mRenderThread.setName("RecordFBO GL render");
         mRenderThread.start();
+        // run() 会创建 Looper、Handler 和 EGLCore；等待 ready 后才能安全投递消息。
         mRenderThread.waitUntilReady();
         mRenderThread.setRecordMethod(mSelectedRecordMethod);
 
@@ -170,7 +214,7 @@ public class RecordFBOActivity extends Activity implements SurfaceHolder.Callbac
             rh.sendSurfaceCreated();
         }
 
-        // start the draw events
+        // 从下一次 VSYNC 开始驱动动画和绘制。
         Choreographer.getInstance().postFrameCallback(this);
     }
 
@@ -178,6 +222,8 @@ public class RecordFBOActivity extends Activity implements SurfaceHolder.Callbac
     public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
         Log.d(TAG, "surfaceChanged fmt=" + format + " size=" + width + "x" + height +
                 " holder=" + holder);
+        // SurfaceHolder 回调运行在 UI 线程，不能直接调用渲染线程中的 GL API；通过 Handler
+        // 转发尺寸，使 viewport、投影矩阵和 FBO 都在拥有 EGLContext 的线程中更新。
         RenderHandler rh = mRenderThread.getHandler();
         if (rh != null) {
             rh.sendSurfaceChanged(format, width, height);
@@ -188,10 +234,8 @@ public class RecordFBOActivity extends Activity implements SurfaceHolder.Callbac
     public void surfaceDestroyed(SurfaceHolder holder) {
         Log.d(TAG, "surfaceDestroyed holder=" + holder);
 
-        // We need to wait for the render thread to shut down before continuing because we
-        // don't want the Surface to disappear out from under it mid-render.  The frame
-        // notifications will have been stopped back in onPause(), but there might have
-        // been one in progress.
+        // 必须等待渲染线程退出，避免 Surface 已销毁而渲染线程仍在绘制或交换 buffer。
+        // onPause() 通常已经移除了 VSYNC 回调，但仍可能有一个帧消息正在执行。
         //
         // TODO: the RenderThread doesn't currently wait for the encoder / muxer to stop,
         //       so we can't use this as an indication that the .mp4 file is complete.
@@ -209,14 +253,16 @@ public class RecordFBOActivity extends Activity implements SurfaceHolder.Callbac
         mRenderThread = null;
         mRecordingEnabled = false;
 
-        // If the callback was posted, remove it.  Without this, we could get one more
-        // call on doFrame().
+        // 再次移除回调，防止 Surface 销毁后又收到一次 doFrame()。
         Choreographer.getInstance().removeFrameCallback(this);
         Log.d(TAG, "surfaceDestroyed complete");
     }
 
-    /*
-     * Choreographer callback, called near vsync.
+    /**
+     * Choreographer 在接近 VSYNC 时调用的 UI 线程回调。
+     *
+     * <p>这里不直接绘制，只把纳秒时间戳转发给渲染线程，并立即注册下一次回调。
+     * 时间戳使用系统单调时钟，渲染线程可以用它计算动画时间和帧耗时。</p>
      *
      * @see android.view.Choreographer.FrameCallback#doFrame(long)
      */
@@ -224,6 +270,7 @@ public class RecordFBOActivity extends Activity implements SurfaceHolder.Callbac
     public void doFrame(long frameTimeNanos) {
         RenderHandler rh = mRenderThread.getHandler();
         if (rh != null) {
+            // 先注册下一次回调，再投递当前帧，形成持续的 VSYNC 驱动循环。
             Choreographer.getInstance().postFrameCallback(this);
             rh.sendDoFrame(frameTimeNanos);
         }
@@ -235,6 +282,7 @@ public class RecordFBOActivity extends Activity implements SurfaceHolder.Callbac
      * Called from the render thread (via ActivityHandler) after the EGL context is created.
      */
     void handleShowGlesVersion(int version) {
+        // 该方法由 ActivityHandler 回到 UI 线程执行，不能从渲染线程直接改 View。
         TextView tv = (TextView) findViewById(R.id.glesVersionValue_text);
         tv.setText("" + version);
         if (version >= 3) {
@@ -249,6 +297,7 @@ public class RecordFBOActivity extends Activity implements SurfaceHolder.Callbac
      * Called periodically from the render thread (via ActivityHandler).
      */
     void handleUpdateFps(int tfps, int dropped) {
+        // tfps 为“FPS × 1000”，这样可以绕过 Message 只能传 int 的限制保留小数。
         String str = getString(R.string.frameRateFormat, tfps / 1000.0f, dropped);
         TextView tv = (TextView) findViewById(R.id.frameRateValue_text);
         tv.setText(str);
@@ -265,6 +314,8 @@ public class RecordFBOActivity extends Activity implements SurfaceHolder.Callbac
         Log.d(TAG, "clickToggleRecording");
         RenderHandler rh = mRenderThread.getHandler();
         if (rh != null) {
+            // 先更新 UI，再把状态消息交给渲染线程。真正创建/销毁编码器必须在 GL 线程完成，
+            // 因为编码器输入 Surface 要和该线程的 EGLContext 配合使用。
             mRecordingEnabled = !mRecordingEnabled;
             updateControls();
             rh.setRecordingEnabled(mRecordingEnabled);
@@ -281,6 +332,7 @@ public class RecordFBOActivity extends Activity implements SurfaceHolder.Callbac
             return;
         }
 
+        // 单选按钮只改变渲染策略，不会立刻重建编码器；下一帧会读取新的策略。
         int id = rb.getId();
         if (id == R.id.recDrawTwice_radio) {
             mSelectedRecordMethod = RECMETHOD_DRAW_TWICE;
@@ -303,6 +355,8 @@ public class RecordFBOActivity extends Activity implements SurfaceHolder.Callbac
      * Updates the on-screen controls to reflect the current state of the app.
      */
     private void updateControls() {
+        // 所有控件状态集中在这里更新，避免生命周期回调、GLES 版本回调和点击回调各自维护
+        // 一套不一致的 UI 状态。
         Button toggleRelease = (Button) findViewById(R.id.fboRecord_button);
         int id = mRecordingEnabled ?
                 R.string.toggleRecordingOff : R.string.toggleRecordingOn;
@@ -335,7 +389,8 @@ public class RecordFBOActivity extends Activity implements SurfaceHolder.Callbac
         private static final int MSG_GLES_VERSION = 0;
         private static final int MSG_UPDATE_FPS = 1;
 
-        // Weak reference to the Activity; only access this from the UI thread.
+        // 使用弱引用避免消息队列中的 Handler 消息反向持有 Activity，降低生命周期泄漏风险。
+        // handleMessage() 运行在 UI 线程，因此只有在那里访问 Activity。
         private WeakReference<RecordFBOActivity> mWeakActivity;
 
         public ActivityHandler(RecordFBOActivity activity) {
@@ -348,6 +403,7 @@ public class RecordFBOActivity extends Activity implements SurfaceHolder.Callbac
          * Call from non-UI thread.
          */
         public void sendGlesVersion(int version) {
+            // sendMessage() 可以从渲染线程调用，消息最终由 UI 线程的 Looper 处理。
             sendMessage(obtainMessage(MSG_GLES_VERSION, version, 0));
         }
 
@@ -359,6 +415,7 @@ public class RecordFBOActivity extends Activity implements SurfaceHolder.Callbac
          * Call from non-UI thread.
          */
         public void sendFpsUpdate(int tfps, int dropped) {
+            // arg1 保存放大 1000 倍的 FPS，arg2 保存丢帧数。
             sendMessage(obtainMessage(MSG_UPDATE_FPS, tfps, dropped));
         }
 
@@ -388,71 +445,92 @@ public class RecordFBOActivity extends Activity implements SurfaceHolder.Callbac
 
 
     /**
-     * This class handles all OpenGL rendering.
-     * <p>
-     * We use Choreographer to coordinate with the device vsync.  We deliver one frame
-     * per vsync.  We can't actually know when the frame we render will be drawn, but at
-     * least we get a consistent frame interval.
-     * <p>
-     * Start the render thread after the Surface has been created.
+     * 负责所有 EGL、OpenGL ES 绘制以及编码器输入 Surface 的提交。
+     *
+     * <p>该线程拥有唯一的 EGLContext。UI 线程不直接调用 GL API，只通过
+     * {@link RenderHandler} 投递消息；这样可以保证所有 GL 对象都在拥有正确 EGLContext 的
+     * 线程中创建、使用和销毁。线程内部还创建 WindowSurface，分别包装屏幕 Surface 和
+     * MediaCodec 输入 Surface，并在两者之间切换当前 EGLSurface。</p>
+     *
+     * <p>VSYNC 回调每次只产生一个帧时间戳，但本线程可能因为 CPU/GPU 或编码器背压来不及
+     * 完成上一帧。doFrame() 会在开始绘制前估算剩余时间，来不及完成时主动丢帧，避免越积
+     * 越多地落后于显示节奏。</p>
+     *
+     * <p>必须在 Surface 创建后启动本线程。Surface 是 EGL window surface 的底层 native
+     * 目标；如果过早创建 WindowSurface，可能得到无效的 EGLSurface 或在后续尺寸变化时
+     * 使用错误的窗口状态。</p>
      */
     private static class RenderThread extends Thread {
         // Object must be created on render thread to get correct Looper, but is used from
         // UI thread, so we need to declare it volatile to ensure the UI thread sees a fully
         // constructed object.
+        /** 绑定到本线程 Looper 的消息处理器；volatile 让 UI 线程及时看到它。 */
         private volatile RenderHandler mHandler;
 
-        // Handler we can send messages to if we want to update the app UI.
+        /** 向 UI 线程发送 GLES 版本、FPS 和丢帧统计的 Handler。 */
         private ActivityHandler mActivityHandler;
 
-        // Used to wait for the thread to start.
+        /** 用于同步线程初始化完成的锁对象。 */
         private Object mStartLock = new Object();
+        /** run() 是否已经创建 Handler/EglCore，可以接收消息。 */
         private boolean mReady = false;
 
-        private volatile SurfaceHolder mSurfaceHolder;  // may be updated by UI thread
+        /** SurfaceHolder 可能由 UI 线程更新，因此使用 volatile 保证引用可见。 */
+        private volatile SurfaceHolder mSurfaceHolder;
+        /** EGLDisplay、EGLContext 和 EGLConfig 的封装。 */
         private EglCore mEglCore;
+        /** 屏幕窗口对应的 EGLSurface。 */
         private WindowSurface mWindowSurface;
+        /** 绘制纯色几何图形的 GL program。 */
         private FlatShadedProgram mProgram;
 
-        // Orthographic projection matrix.
+        /** 以像素为单位的正交投影矩阵，左下角为坐标原点。 */
         private float[] mDisplayProjectionMatrix = new float[16];
 
+        /** 三角形和矩形的共享几何数据；Sprite2d 保存各自的位置、缩放和颜色。 */
         private final Drawable2d mTriDrawable = new Drawable2d(Drawable2d.Prefab.TRIANGLE);
         private final Drawable2d mRectDrawable = new Drawable2d(Drawable2d.Prefab.RECTANGLE);
 
-        // One spinning triangle, one bouncing rectangle, and four edge-boxes.
+        /** 一个旋转三角形、一个移动矩形、四个边框矩形和一个录制策略指示块。 */
         private Sprite2d mTri;
         private Sprite2d mRect;
         private Sprite2d mEdges[];
         private Sprite2d mRecordRect;
-        private float mRectVelX, mRectVelY;     // velocity, in viewport units per second
+        /** 移动矩形速度，单位为 viewport 像素/秒。 */
+        private float mRectVelX, mRectVelY;
+        /** 移动矩形反弹时使用的内边界。 */
         private float mInnerLeft, mInnerTop, mInnerRight, mInnerBottom;
 
+        /** 把离屏纹理绘制到输出 Surface 时使用的单位矩阵。 */
         private final float[] mIdentityMatrix;
 
-        // Previous frame time.
+        /** 上一次 VSYNC 时间戳，用于计算动画推进的时间差。 */
         private long mPrevTimeNanos;
 
-        // FPS / drop counter.
+        /** 屏幕刷新周期，用于判断本帧是否已经来不及绘制。 */
         private long mRefreshPeriodNanos;
+        /** FPS 采样窗口的起始时间和已经统计的帧数。 */
         private long mFpsCountStartNanos;
         private int mFpsCountFrame;
+        /** 累计丢帧数，以及上一帧是否丢失。 */
         private int mDroppedFrames;
         private boolean mPreviousWasDropped;
 
-        // Used for off-screen rendering.
+        /** FBO 的颜色纹理、framebuffer、深度 renderbuffer 和纹理绘制器。 */
         private int mOffscreenTexture;
         private int mFramebuffer;
         private int mDepthBuffer;
         private FullFrameRect mFullScreen;
 
-        // Used for recording.
+        /** 是否录制、输出文件、编码器输入 EGLSurface 等录制状态。 */
         private boolean mRecordingEnabled;
         private File mOutputFile;
         private WindowSurface mInputWindowSurface;
         private TextureMovieEncoder2 mVideoEncoder;
         private int mRecordMethod;
+        /** 用于隔帧录制：true 表示上一显示帧已经提交到视频。 */
         private boolean mRecordedPrevious;
+        /** 固定 1280x720 输出画面中真正绘制内容的区域，用于留黑边保持比例。 */
         private Rect mVideoRect;
 
 
@@ -461,16 +539,20 @@ public class RecordFBOActivity extends Activity implements SurfaceHolder.Callbac
          */
         public RenderThread(SurfaceHolder holder, ActivityHandler ahandler, File outputFile,
                 long refreshPeriodNs) {
+            // holder 的 Surface 此时可能尚未存在；这里只保存引用，真正的 EGLSurface 在
+            // surfaceCreated() 消息中创建。刷新周期来自显示设备，用于丢帧判断。
             mSurfaceHolder = holder;
             mActivityHandler = ahandler;
             mOutputFile = outputFile;
             mRefreshPeriodNanos = refreshPeriodNs;
 
+            // mVideoRect 稍后根据窗口比例计算；输出视频固定为 1280x720。
             mVideoRect = new Rect();
 
             mIdentityMatrix = new float[16];
             Matrix.setIdentityM(mIdentityMatrix, 0);
 
+            // Sprite2d 只保存场景对象的变换和颜色，实际顶点绘制在 draw() 中完成。
             mTri = new Sprite2d(mTriDrawable);
             mRect = new Sprite2d(mRectDrawable);
             mEdges = new Sprite2d[4];
@@ -489,17 +571,24 @@ public class RecordFBOActivity extends Activity implements SurfaceHolder.Callbac
          */
         @Override
         public void run() {
+            // Looper/Handler 必须在本线程创建，消息处理才会回到渲染线程；EGLContext 也在
+            // 本线程创建，后续所有 GL 调用都由这里串行执行。
             Looper.prepare();
             mHandler = new RenderHandler(this);
+            // FLAG_RECORDABLE 让 EGLConfig 适合 MediaCodec 输入 Surface；TRY_GLES3 表示优先
+            // GLES 3，若设备不支持则回退到 GLES 2。
             mEglCore = new EglCore(null, EglCore.FLAG_RECORDABLE | EglCore.FLAG_TRY_GLES3);
             synchronized (mStartLock) {
                 mReady = true;
-                mStartLock.notify();    // signal waitUntilReady()
+                // 通知 UI 线程：Handler 和 EglCore 已经建立，可以开始投递 Surface 消息。
+                mStartLock.notify();
             }
 
+            // 阻塞处理 Surface、VSYNC、录制开关等消息；收到 shutdown 后才退出。
             Looper.loop();
 
             Log.d(TAG, "looper quit");
+            // Looper 退出后仍在当前 GL 线程，因此现在释放 GL 对象最安全；之后才释放 EGLCore。
             releaseGl();
             mEglCore.release();
 
@@ -528,6 +617,8 @@ public class RecordFBOActivity extends Activity implements SurfaceHolder.Callbac
          */
         private void shutdown() {
             Log.d(TAG, "shutdown");
+            // 先停止编码器，再退出 Looper；这样停止消息在编码线程中异步收尾，当前 GL 线程
+            // 不再提交新的编码帧。
             stopEncoder();
             Looper.myLooper().quit();
         }
@@ -536,6 +627,7 @@ public class RecordFBOActivity extends Activity implements SurfaceHolder.Callbac
          * Returns the render thread's Handler.  This may be called from any thread.
          */
         public RenderHandler getHandler() {
+            // 可能在 run() 初始化前返回 null，调用方必须判空。
             return mHandler;
         }
 
@@ -543,6 +635,8 @@ public class RecordFBOActivity extends Activity implements SurfaceHolder.Callbac
          * Prepares the surface.
          */
         private void surfaceCreated() {
+            // getSurface() 返回的是 SurfaceView 的 native window，WindowSurface 会把它包装
+            // 成当前 EGLContext 可以绘制的 EGLSurface。
             Surface surface = mSurfaceHolder.getSurface();
             prepareGl(surface);
         }
@@ -553,26 +647,28 @@ public class RecordFBOActivity extends Activity implements SurfaceHolder.Callbac
         private void prepareGl(Surface surface) {
             Log.d(TAG, "prepareGl");
 
+            // false 表示这是屏幕输出，不是 MediaCodec 输入 Surface。
             mWindowSurface = new WindowSurface(mEglCore, surface, false);
             mWindowSurface.makeCurrent();
 
-            // Used for blitting texture to FBO.
+            // 用纹理 program 把离屏颜色纹理铺满当前输出 Surface；FBO 路径会复用它两次。
             mFullScreen = new FullFrameRect(
                     new Texture2dProgram(Texture2dProgram.ProgramType.TEXTURE_2D));
 
-            // Program used for drawing onto the screen.
+            // FlatShadedProgram 用于绘制三角形、矩形和边框等纯色几何图形。
             mProgram = new FlatShadedProgram();
 
-            // Set the background color.
+            // draw() 会根据需要修改 clear color；这里设置一个安全的初始值。
             GLES20.glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
 
-            // Disable depth testing -- we're 2D only.
+            // 场景只有 2D 图形，不需要深度测试或背面剔除。
             GLES20.glDisable(GLES20.GL_DEPTH_TEST);
 
             // Don't need backface culling.  (If you're feeling pedantic, you can turn it on to
             // make sure we're defining our shapes correctly.)
             GLES20.glDisable(GLES20.GL_CULL_FACE);
 
+            // 把实际创建的 GLES 版本回传 UI；UI 据此决定是否允许 framebuffer blit 单选项。
             mActivityHandler.sendGlesVersion(mEglCore.getGlVersion());
         }
 
@@ -584,20 +680,20 @@ public class RecordFBOActivity extends Activity implements SurfaceHolder.Callbac
         private void surfaceChanged(int width, int height) {
             Log.d(TAG, "surfaceChanged " + width + "x" + height);
 
+            // 尺寸改变后旧的离屏附件尺寸也不再匹配，因此先重新创建 width x height 的 FBO，
+            // 再设置 viewport 和投影矩阵。
             prepareFramebuffer(width, height);
 
-            // Use full window.
+            // 屏幕绘制使用完整窗口；切到编码器时会临时改为 mVideoRect。
             GLES20.glViewport(0, 0, width, height);
 
-            // Simple orthographic projection, with (0,0) in lower-left corner.
+            // 使用像素坐标的正交投影，左下角为 (0, 0)，右上角为 (width, height)。
             Matrix.orthoM(mDisplayProjectionMatrix, 0, 0, width, 0, height, -1, 1);
 
             int smallDim = Math.min(width, height);
 
-            // Set initial shape size / position / velocity based on window size.  Movement
-            // has the same "feel" on all devices, but the actual path will vary depending
-            // on the screen proportions.  We do it here, rather than defining fixed values
-            // and tweaking the projection matrix, so that our squares are square.
+            // 根据窗口短边初始化图形大小、位置和速度。投影仍然使用真实像素尺寸，因此在
+            // 不同宽高比的设备上，正方形不会被拉伸。
             mTri.setColor(0.1f, 0.9f, 0.1f);
             mTri.setScale(smallDim / 4.0f, smallDim / 4.0f);
             mTri.setPosition(width / 2.0f, height / 2.0f);
@@ -625,7 +721,7 @@ public class RecordFBOActivity extends Activity implements SurfaceHolder.Callbac
             mRecordRect.setScale(edgeWidth * 2f, edgeWidth * 2f);
             mRecordRect.setPosition(edgeWidth / 2.0f, edgeWidth / 2.0f);
 
-            // Inner bounding rect, used to bounce objects off the walls.
+            // 移动矩形只在四条边框内部反弹。
             mInnerLeft = mInnerBottom = edgeWidth;
             mInnerRight = width - 1 - edgeWidth;
             mInnerTop = height - 1 - edgeWidth;
@@ -642,19 +738,19 @@ public class RecordFBOActivity extends Activity implements SurfaceHolder.Callbac
 
             int[] values = new int[1];
 
-            // Create a texture object and bind it.  This will be the color buffer.
+            // 创建颜色纹理。FBO 不直接把颜色存到屏幕，而是把每个像素写入这张纹理，之后
+            // 可以在不同输出 Surface 上重复使用同一份渲染结果。
             GLES20.glGenTextures(1, values, 0);
             GlUtil.checkGlError("glGenTextures");
             mOffscreenTexture = values[0];   // expected > 0
             GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, mOffscreenTexture);
             GlUtil.checkGlError("glBindTexture " + mOffscreenTexture);
 
-            // Create texture storage.
+            // 分配 width x height 的 RGBA 纹理存储；null 表示只分配存储，不上传初始像素。
             GLES20.glTexImage2D(GLES20.GL_TEXTURE_2D, 0, GLES20.GL_RGBA, width, height, 0,
                     GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, null);
 
-            // Set parameters.  We're probably using non-power-of-two dimensions, so
-            // some values may not be available for use.
+            // 设置采样和边缘模式。线性放大可减少缩放锯齿，CLAMP_TO_EDGE 防止采样越过边界。
             GLES20.glTexParameterf(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER,
                     GLES20.GL_NEAREST);
             GLES20.glTexParameterf(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER,
@@ -665,26 +761,27 @@ public class RecordFBOActivity extends Activity implements SurfaceHolder.Callbac
                     GLES20.GL_CLAMP_TO_EDGE);
             GlUtil.checkGlError("glTexParameter");
 
-            // Create framebuffer object and bind it.
+            // 创建并绑定 FBO；此后对颜色和深度附件的设置都针对这个 FBO。
             GLES20.glGenFramebuffers(1, values, 0);
             GlUtil.checkGlError("glGenFramebuffers");
             mFramebuffer = values[0];    // expected > 0
             GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, mFramebuffer);
             GlUtil.checkGlError("glBindFramebuffer " + mFramebuffer);
 
-            // Create a depth buffer and bind it.
+            // 创建深度 renderbuffer。虽然当前二维场景关闭了深度测试，但保留深度附件使
+            // FBO 结构完整，也便于扩展为需要深度的绘制。
             GLES20.glGenRenderbuffers(1, values, 0);
             GlUtil.checkGlError("glGenRenderbuffers");
             mDepthBuffer = values[0];    // expected > 0
             GLES20.glBindRenderbuffer(GLES20.GL_RENDERBUFFER, mDepthBuffer);
             GlUtil.checkGlError("glBindRenderbuffer " + mDepthBuffer);
 
-            // Allocate storage for the depth buffer.
+            // 为深度附件分配与窗口同尺寸的 16 位深度存储。
             GLES20.glRenderbufferStorage(GLES20.GL_RENDERBUFFER, GLES20.GL_DEPTH_COMPONENT16,
                     width, height);
             GlUtil.checkGlError("glRenderbufferStorage");
 
-            // Attach the depth buffer and the texture (color buffer) to the framebuffer object.
+            // 把深度 renderbuffer 和颜色纹理挂到 FBO 上；gl_FragColor 会写入颜色纹理。
             GLES20.glFramebufferRenderbuffer(GLES20.GL_FRAMEBUFFER, GLES20.GL_DEPTH_ATTACHMENT,
                     GLES20.GL_RENDERBUFFER, mDepthBuffer);
             GlUtil.checkGlError("glFramebufferRenderbuffer");
@@ -692,13 +789,13 @@ public class RecordFBOActivity extends Activity implements SurfaceHolder.Callbac
                     GLES20.GL_TEXTURE_2D, mOffscreenTexture, 0);
             GlUtil.checkGlError("glFramebufferTexture2D");
 
-            // See if GLES is happy with all this.
+            // 检查颜色、深度附件尺寸和格式是否满足 FBO 完整性要求。
             int status = GLES20.glCheckFramebufferStatus(GLES20.GL_FRAMEBUFFER);
             if (status != GLES20.GL_FRAMEBUFFER_COMPLETE) {
                 throw new RuntimeException("Framebuffer not complete, status=" + status);
             }
 
-            // Switch back to the default framebuffer.
+            // 恢复默认 framebuffer 0。后续屏幕绘制应写入窗口 Surface，而不是继续写入离屏 FBO。
             GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0);
 
             GlUtil.checkGlError("prepareFramebuffer done");
@@ -714,6 +811,8 @@ public class RecordFBOActivity extends Activity implements SurfaceHolder.Callbac
 
             int[] values = new int[1];
 
+            // releaseGl() 在渲染线程、EGLContext 仍可用时执行。先释放依赖 EGLSurface/GL
+            // context 的对象，最后由 run() 再释放 EglCore。
             if (mWindowSurface != null) {
                 mWindowSurface.release();
                 mWindowSurface = null;
@@ -738,6 +837,8 @@ public class RecordFBOActivity extends Activity implements SurfaceHolder.Callbac
                 mDepthBuffer = -1;
             }
             if (mFullScreen != null) {
+                // FullFrameRect 内部包含纹理绘制 program。这里的 false 是原实现行为；释放
+                // 完成后 makeNothingCurrent()，避免 EGLContext 继续绑定已销毁 Surface。
                 mFullScreen.release(false); // TODO: should be "true"; must ensure mEglCore current
                 mFullScreen = null;
             }
@@ -754,6 +855,8 @@ public class RecordFBOActivity extends Activity implements SurfaceHolder.Callbac
             if (enabled == mRecordingEnabled) {
                 return;
             }
+            // 编码器的创建、输入 EGLSurface 的包装和停止都在渲染线程串行完成，避免同一
+            // EGLContext 同时被多个线程操作。
             if (enabled) {
                 startEncoder();
             } else {
@@ -767,6 +870,7 @@ public class RecordFBOActivity extends Activity implements SurfaceHolder.Callbac
          */
         private void setRecordMethod(int recordMethod) {
             Log.d(TAG, "RT: setRecordMethod " + recordMethod);
+            // 只切换下一次 doFrame() 采用的分支，不需要重新创建 FBO 或编码器。
             mRecordMethod = recordMethod;
         }
 
@@ -776,9 +880,8 @@ public class RecordFBOActivity extends Activity implements SurfaceHolder.Callbac
          */
         private void startEncoder() {
             Log.d(TAG, "starting to record");
-            // Record at 1280x720, regardless of the window dimensions.  The encoder may
-            // explode if given "strange" dimensions, e.g. a width that is not a multiple
-            // of 16.  We can box it as needed to preserve dimensions.
+            // 统一输出 1280x720，避免把设备窗口的任意尺寸直接交给编码器。某些硬件编码器
+            // 对非典型尺寸、尤其是非 16 对齐尺寸支持不好，因此通过黑边保持画面比例。
             final int BIT_RATE = 4000000;   // 4Mbps
             final int VIDEO_WIDTH = 1280;
             final int VIDEO_HEIGHT = 720;
@@ -797,11 +900,15 @@ public class RecordFBOActivity extends Activity implements SurfaceHolder.Callbac
             }
             int offX = (VIDEO_WIDTH - outWidth) / 2;
             int offY = (VIDEO_HEIGHT - outHeight) / 2;
+            // mVideoRect 是视频坐标中的有效画面区域；区域以外保持黑色，形成 pillarbox 或
+            // letterbox。注意 OpenGL 的 viewport 坐标原点在左下角。
             mVideoRect.set(offX, offY, offX + outWidth, offY + outHeight);
             Log.d(TAG, "Adjusting window " + windowWidth + "x" + windowHeight +
                     " to +" + offX + ",+" + offY + " " +
                     mVideoRect.width() + "x" + mVideoRect.height());
 
+            // 先创建 MediaCodec 输入 Surface，再用同一个 EglCore 包装它；之后 doFrame() 会
+            // 在屏幕 EGLSurface 和该输入 EGLSurface 之间切换。
             VideoEncoderCore encoderCore;
             try {
                 encoderCore = new VideoEncoderCore(VIDEO_WIDTH, VIDEO_HEIGHT,
@@ -819,12 +926,15 @@ public class RecordFBOActivity extends Activity implements SurfaceHolder.Callbac
         private void stopEncoder() {
             if (mVideoEncoder != null) {
                 Log.d(TAG, "stopping recorder, mVideoEncoder=" + mVideoEncoder);
+                // stopRecording() 只是向编码线程发送 EOS/停止消息，通常会异步返回；因此
+                // 这里不能把它当作 MP4 已经完成写入的同步屏障。
                 mVideoEncoder.stopRecording();
                 // TODO: wait (briefly) until it finishes shutting down so we know file is
                 //       complete, or have a callback that updates the UI
                 mVideoEncoder = null;
             }
             if (mInputWindowSurface != null) {
+                // EGLSurface 只依赖编码器输入 Surface；释放它不会释放共享的 EglCore。
                 mInputWindowSurface.release();
                 mInputWindowSurface = null;
             }
@@ -834,6 +944,8 @@ public class RecordFBOActivity extends Activity implements SurfaceHolder.Callbac
          * Advance state and draw frame in response to a vsync event.
          */
         private void doFrame(long timeStampNanos) {
+            // 这条消息来自 UI 线程的 Choreographer，但下面的全部工作在渲染线程执行。
+            // 一个 timeStamp 对应一次显示节奏；录制时仍以同一个时间戳提交视频 PTS。
             // If we're not keeping up 60fps -- maybe something in the system is busy, maybe
             // recording is too expensive, maybe the CPU frequency governor thinks we're
             // not doing and wants to drop the clock frequencies -- we need to drop frames
@@ -850,6 +962,9 @@ public class RecordFBOActivity extends Activity implements SurfaceHolder.Callbac
 
             update(timeStampNanos);
 
+            // timeStampNanos 和 System.nanoTime() 使用同一个单调时钟。若从收到 VSYNC 到
+            // 当前时刻已经接近下一个刷新周期，继续绘制只会让画面越来越滞后，因此主动丢掉
+            // 本帧；动画状态已经更新，下一帧会从最新状态继续。
             long diff = System.nanoTime() - timeStampNanos;
             long max = mRefreshPeriodNanos - 2000000;   // if we're within 2ms, don't bother
             if (diff > max) {
@@ -865,6 +980,8 @@ public class RecordFBOActivity extends Activity implements SurfaceHolder.Callbac
             boolean swapResult;
 
             if (!mRecordingEnabled || mRecordedPrevious) {
+                // 未录制时每个 VSYNC 都绘制屏幕；录制时 mRecordedPrevious=true 表示上一
+                // 次已经提交视频，所以当前帧只更新屏幕，从而大约每两个显示帧录制一帧。
                 mRecordedPrevious = false;
                 // Render the scene, swap back to front.
                 draw();
@@ -874,14 +991,18 @@ public class RecordFBOActivity extends Activity implements SurfaceHolder.Callbac
 
                 // recording
                 if (mRecordMethod == RECMETHOD_DRAW_TWICE) {
+                    // 策略一：屏幕和编码器各绘制一次。优点是视频可以直接按目标尺寸绘制，
+                    // 缺点是场景顶点/片元工作执行两遍。
                     //Log.d(TAG, "MODE: draw 2x");
 
-                    // Draw for display, swap.
+                    // 先绘制并提交屏幕帧；此时当前 EGLSurface 是 mWindowSurface。
                     draw();
                     swapResult = mWindowSurface.swapBuffers();
 
-                    // Draw for recording, swap.
+                    // 通知编码线程尽快排空旧输出，防止 MediaCodec 输出队列造成背压。
                     mVideoEncoder.frameAvailableSoon();
+                    // 切换当前 EGLSurface 到编码器输入 Surface。后面的 GL 绘制不会出现在
+                    // 屏幕上，而是作为一帧送入 MediaCodec。
                     mInputWindowSurface.makeCurrent();
                     // If we don't set the scissor rect, the glClear() we use to draw the
                     // light-grey background will draw outside the viewport and muck up our
@@ -897,9 +1018,11 @@ public class RecordFBOActivity extends Activity implements SurfaceHolder.Callbac
                     //
                     // For now, be lazy and zero the whole thing.  At some point we need to
                     // examine the performance here.
+                    // 先清成黑色，保证 mVideoRect 外部的 letterbox/pillarbox 没有旧数据。
                     GLES20.glClearColor(0f, 0f, 0f, 1f);
                     GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT);
 
+                    // 只在有效画面区域绘制，并使用 scissor 防止 draw() 的清屏覆盖黑边。
                     GLES20.glViewport(mVideoRect.left, mVideoRect.top,
                             mVideoRect.width(), mVideoRect.height());
                     GLES20.glEnable(GLES20.GL_SCISSOR_TEST);
@@ -907,23 +1030,27 @@ public class RecordFBOActivity extends Activity implements SurfaceHolder.Callbac
                             mVideoRect.width(), mVideoRect.height());
                     draw();
                     GLES20.glDisable(GLES20.GL_SCISSOR_TEST);
+                    // Surface 的 presentation timestamp 会成为视频帧的 PTS，影响播放时序。
                     mInputWindowSurface.setPresentationTime(timeStampNanos);
                     mInputWindowSurface.swapBuffers();
 
-                    // Restore.
+                    // 恢复屏幕 viewport 和当前 EGLSurface，下一次非录制分支仍能正常绘制屏幕。
                     GLES20.glViewport(0, 0, mWindowSurface.getWidth(), mWindowSurface.getHeight());
                     mWindowSurface.makeCurrent();
 
                 } else if (mEglCore.getGlVersion() >= 3 &&
                         mRecordMethod == RECMETHOD_BLIT_FRAMEBUFFER) {
+                    // 策略二：GLES 3 framebuffer blit。先把场景绘制到屏幕 framebuffer，
+                    // 再把它复制到编码器 Surface；场景本身只执行一次。
                     //Log.d(TAG, "MODE: blitFramebuffer");
-                    // Draw the frame, but don't swap it yet.
+                    // 绘制到屏幕 back buffer，但暂时不 swap，这样内容仍可作为 read framebuffer。
                     draw();
 
                     mVideoEncoder.frameAvailableSoon();
+                    // makeCurrentReadFrom() 将编码器 Surface 设为 draw surface，将屏幕
+                    // Surface 设为 read surface；glBlitFramebuffer() 随后从屏幕读取像素。
                     mInputWindowSurface.makeCurrentReadFrom(mWindowSurface);
-                    // Clear the pixels we're not going to overwrite with the blit.  Once again,
-                    // this is excessive -- we don't need to clear the entire screen.
+                    // 先把编码器目标清成黑色，避免 mVideoRect 之外残留上一帧的垃圾像素。
                     GLES20.glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
                     GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT);
                     GlUtil.checkGlError("before glBlitFramebuffer");
@@ -931,6 +1058,8 @@ public class RecordFBOActivity extends Activity implements SurfaceHolder.Callbac
                             mWindowSurface.getHeight() + "  " + mVideoRect.left + "," +
                             mVideoRect.top + "," + mVideoRect.right + "," + mVideoRect.bottom +
                             "  COLOR_BUFFER GL_NEAREST");
+                    // 把屏幕 framebuffer 的完整区域缩放复制到视频有效区域。GL_NEAREST 与
+                    // 这里的像素复制语义一致，也避免额外的纹理采样状态。
                     GLES30.glBlitFramebuffer(
                             0, 0, mWindowSurface.getWidth(), mWindowSurface.getHeight(),
                             mVideoRect.left, mVideoRect.top, mVideoRect.right, mVideoRect.bottom,
@@ -943,49 +1072,57 @@ public class RecordFBOActivity extends Activity implements SurfaceHolder.Callbac
                     mInputWindowSurface.setPresentationTime(timeStampNanos);
                     mInputWindowSurface.swapBuffers();
 
-                    // Now swap the display buffer.
+                    // 编码帧已经提交后，切回屏幕 Surface 并 swap，真正显示刚才绘制的画面。
                     mWindowSurface.makeCurrent();
                     swapResult = mWindowSurface.swapBuffers();
 
                 } else {
+                    // 策略三（默认 FBO）：场景只绘制到离屏 FBO 一次，再通过纹理复制到两个
+                    // 输出。与 framebuffer blit 不同，这条路径在 GLES 2 也能工作。
                     //Log.d(TAG, "MODE: offscreen + blit 2x");
-                    // Render offscreen.
+                    // 绑定离屏 FBO，draw() 的颜色输出会进入 mOffscreenTexture。
                     GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, mFramebuffer);
                     GlUtil.checkGlError("glBindFramebuffer");
                     draw();
 
-                    // Blit to display.
+                    // 恢复默认 framebuffer，把离屏颜色纹理绘制到屏幕并提交。
                     GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0);
                     GlUtil.checkGlError("glBindFramebuffer");
                     mFullScreen.drawFrame(mOffscreenTexture, mIdentityMatrix);
                     swapResult = mWindowSurface.swapBuffers();
 
-                    // Blit to encoder.
+                    // 再把同一张离屏纹理绘制到编码器输入 Surface；这里不需要再次执行场景
+                    // 的三角形/矩形绘制，只需执行一次全屏纹理绘制。
                     mVideoEncoder.frameAvailableSoon();
                     mInputWindowSurface.makeCurrent();
-                    GLES20.glClearColor(0.0f, 0.0f, 0.0f, 1.0f);    // again, only really need to
-                    GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT);     //  clear pixels outside rect
+                    GLES20.glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+                    GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT);
                     GLES20.glViewport(mVideoRect.left, mVideoRect.top,
                             mVideoRect.width(), mVideoRect.height());
                     mFullScreen.drawFrame(mOffscreenTexture, mIdentityMatrix);
                     mInputWindowSurface.setPresentationTime(timeStampNanos);
                     mInputWindowSurface.swapBuffers();
 
-                    // Restore previous values.
+                    // 恢复屏幕 viewport 和当前 EGLSurface，保持下一帧的 GL 状态正确。
                     GLES20.glViewport(0, 0, mWindowSurface.getWidth(), mWindowSurface.getHeight());
                     mWindowSurface.makeCurrent();
                 }
             }
 
+            // 能走到这里说明本帧没有被 CPU 时间预算丢弃。
             mPreviousWasDropped = false;
 
             if (!swapResult) {
+                // Surface 可能在 Activity 停止时失效；swap 失败后退出渲染线程，避免继续
+                // 对无效 native window 提交 GL 命令。
                 // This can happen if the Activity stops without waiting for us to halt.
                 Log.w(TAG, "swapBuffers failed, killing renderer thread");
                 shutdown();
                 return;
             }
 
+            // 每 120 个显示帧计算一次 FPS。内部使用“FPS × 1000”的整数，交给 UI 时再还原
+            // 小数；丢帧数则从渲染线程累计后一起上报。
             // Update the FPS counter.
             //
             // Ideally we'd generate something approximate quickly to make the UI look
@@ -1016,6 +1153,8 @@ public class RecordFBOActivity extends Activity implements SurfaceHolder.Callbac
          * the device's actual refresh rate.
          */
         private void update(long timeStampNanos) {
+            // 动画使用 VSYNC 时间戳而不是“本次方法执行耗时”。这样渲染线程偶尔忙碌时，
+            // 物体仍按照真实经过的时间移动，而不是按 CPU 调度次数移动。
             // Compute time from previous frame.
             long intervalNanos;
             if (mPrevTimeNanos == 0) {
@@ -1025,6 +1164,8 @@ public class RecordFBOActivity extends Activity implements SurfaceHolder.Callbac
 
                 final long ONE_SECOND_NANOS = 1000000000L;
                 if (intervalNanos > ONE_SECOND_NANOS) {
+                    // Activity 长时间暂停或 Surface 重建时，巨大的 delta 会让物体瞬移出屏幕；
+                    // 把它当作第一帧，保持动画从当前位置平滑恢复。
                     // A gap this big should only happen if something paused us.  We can
                     // either cap the delta at one second, or just pretend like this is
                     // the first frame and not advance at all.
@@ -1038,15 +1179,13 @@ public class RecordFBOActivity extends Activity implements SurfaceHolder.Callbac
             final float ONE_BILLION_F = 1000000000.0f;
             final float elapsedSeconds = intervalNanos / ONE_BILLION_F;
 
-            // Spin the triangle.  We want one full 360-degree rotation every 3 seconds,
-            // or 120 degrees per second.
+            // 三角形每 3 秒旋转 360 度，即每秒 120 度；角度增量与刷新率无关。
             final int SECS_PER_SPIN = 3;
             float angleDelta = (360.0f / SECS_PER_SPIN) * elapsedSeconds;
             mTri.setRotation(mTri.getRotation() + angleDelta);
 
-            // Bounce the rect around the screen.  The rect is a 1x1 square scaled up to NxN.
-            // We don't do fancy collision detection, so it's possible for the box to slightly
-            // overlap the edges.  We draw the edges last, so it's not noticeable.
+            // 矩形按速度移动，碰到内边界就反转速度。碰撞检测是近似的，可能略微越过边框；
+            // 由于边框最后绘制，视觉上不明显。
             float xpos = mRect.getPositionX();
             float ypos = mRect.getPositionY();
             float xscale = mRect.getScaleX();
@@ -1070,11 +1209,13 @@ public class RecordFBOActivity extends Activity implements SurfaceHolder.Callbac
         private void draw() {
             GlUtil.checkGlError("draw start");
 
+            // 使用灰色内容背景，把输出视频中为保持比例而补的黑色区域区分出来。
             // Clear to a non-black color to make the content easily differentiable from
             // the pillar-/letter-boxing.
             GLES20.glClearColor(0.2f, 0.2f, 0.2f, 1.0f);
             GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT);
 
+            // 先画场景主体，再画边框和左下角录制策略指示块。
             mTri.draw(mProgram, mDisplayProjectionMatrix);
             mRect.draw(mProgram, mDisplayProjectionMatrix);
             for (int i = 0; i < 4; i++) {
@@ -1086,7 +1227,7 @@ public class RecordFBOActivity extends Activity implements SurfaceHolder.Callbac
                 mEdges[i].draw(mProgram, mDisplayProjectionMatrix);
             }
 
-            // Give a visual indication of the recording method.
+            // 左下角色块用于观察当前录制路径：红色=重复绘制，绿色=FBO，蓝色=GLES 3 blit。
             switch (mRecordMethod) {
                 case RECMETHOD_DRAW_TWICE:
                     mRecordRect.setColor(1.0f, 0.0f, 0.0f);
@@ -1106,10 +1247,11 @@ public class RecordFBOActivity extends Activity implements SurfaceHolder.Callbac
     }
 
     /**
-     * Handler for RenderThread.  Used for messages sent from the UI thread to the render thread.
-     * <p>
-     * The object is created on the render thread, and the various "send" methods are called
-     * from the UI thread.
+     * 渲染线程的消息处理器：把 UI 线程的生命周期、VSYNC 和控件操作转发给 RenderThread。
+     *
+     * <p>该对象必须在 RenderThread 中创建，这样 Handler 绑定的是渲染线程自己的 Looper，
+     * {@link #handleMessage(Message)} 才会在正确的线程执行。UI 线程只调用 send 方法，
+     * 不直接碰 EGL 或 OpenGL 对象。</p>
      */
     private static class RenderHandler extends Handler {
         private static final int MSG_SURFACE_CREATED = 0;
@@ -1119,14 +1261,14 @@ public class RecordFBOActivity extends Activity implements SurfaceHolder.Callbac
         private static final int MSG_RECORD_METHOD = 4;
         private static final int MSG_SHUTDOWN = 5;
 
-        // This shouldn't need to be a weak ref, since we'll go away when the Looper quits,
-        // but no real harm in it.
+        // Looper 退出后 Handler 会失效；弱引用仍可避免异常生命周期下消息队列强持有线程。
         private WeakReference<RenderThread> mWeakRenderThread;
 
         /**
          * Call from render thread.
          */
         public RenderHandler(RenderThread rt) {
+            // 构造发生在渲染线程，因此 Handler 自动绑定到渲染线程 Looper。
             mWeakRenderThread = new WeakReference<RenderThread>(rt);
         }
 
@@ -1136,6 +1278,7 @@ public class RecordFBOActivity extends Activity implements SurfaceHolder.Callbac
          * Call from UI thread.
          */
         public void sendSurfaceCreated() {
+            // SurfaceHolder 的 Surface 已经创建，渲染线程现在可以创建 WindowSurface 和 GL 对象。
             sendMessage(obtainMessage(RenderHandler.MSG_SURFACE_CREATED));
         }
 
@@ -1146,7 +1289,7 @@ public class RecordFBOActivity extends Activity implements SurfaceHolder.Callbac
          */
         public void sendSurfaceChanged(@SuppressWarnings("unused") int format,
                 int width, int height) {
-            // ignore format
+            // format 对本例没有影响；只把宽高通过 arg1/arg2 传给渲染线程。
             sendMessage(obtainMessage(RenderHandler.MSG_SURFACE_CHANGED, width, height));
         }
 
@@ -1156,6 +1299,8 @@ public class RecordFBOActivity extends Activity implements SurfaceHolder.Callbac
          * Call from UI thread.
          */
         public void sendDoFrame(long frameTimeNanos) {
+            // Message.arg1/arg2 都是 int，因此把 long 拆成高 32 位和低 32 位传递；接收端
+            // 需要用无符号掩码恢复低位，避免符号扩展破坏时间戳。
             sendMessage(obtainMessage(RenderHandler.MSG_DO_FRAME,
                     (int) (frameTimeNanos >> 32), (int) frameTimeNanos));
         }
@@ -1166,6 +1311,7 @@ public class RecordFBOActivity extends Activity implements SurfaceHolder.Callbac
          * Call from non-UI thread.
          */
         public void setRecordingEnabled(boolean enabled) {
+            // boolean 用 1/0 编码到 arg1，实际 startEncoder()/stopEncoder() 在渲染线程执行。
             sendMessage(obtainMessage(MSG_RECORDING_ENABLED, enabled ? 1 : 0, 0));
         }
 
@@ -1175,6 +1321,7 @@ public class RecordFBOActivity extends Activity implements SurfaceHolder.Callbac
          * Call from non-UI thread.
          */
         public void setRecordMethod(int recordMethod) {
+            // 录制策略是小整数，直接放入 arg1。
             sendMessage(obtainMessage(MSG_RECORD_METHOD, recordMethod, 0));
         }
 
@@ -1184,6 +1331,7 @@ public class RecordFBOActivity extends Activity implements SurfaceHolder.Callbac
          * Call from UI thread.
          */
         public void sendShutdown() {
+            // shutdown() 会停止编码器并退出渲染线程 Looper；Activity 随后 join 等待其结束。
             sendMessage(obtainMessage(RenderHandler.MSG_SHUTDOWN));
         }
 
@@ -1200,12 +1348,14 @@ public class RecordFBOActivity extends Activity implements SurfaceHolder.Callbac
 
             switch (what) {
                 case MSG_SURFACE_CREATED:
+                    // 所有分支都在 RenderThread 上运行，因此可以安全调用 GL API。
                     renderThread.surfaceCreated();
                     break;
                 case MSG_SURFACE_CHANGED:
                     renderThread.surfaceChanged(msg.arg1, msg.arg2);
                     break;
                 case MSG_DO_FRAME:
+                    // 高低位合并回 Choreographer 的纳秒时间戳。
                     long timestamp = (((long) msg.arg1) << 32) |
                                      (((long) msg.arg2) & 0xffffffffL);
                     renderThread.doFrame(timestamp);

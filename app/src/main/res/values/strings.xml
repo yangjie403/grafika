@@ -134,6 +134,7 @@
     <string name="title_activity_read_pixels">glReadPixels speed test</string>
     <string name="title_activity_texture_view_gl">Basic GL in TextureView</string>
     <string name="title_activity_texture_view_canvas">Basic Canvas in TextureView</string>
+    <string name="title_activity_opengles_triangle">OpenGL ES 三角形入门</string>
     <string name="title_activity_live_camera">Live camera (TextureView)</string>
     <string name="title_activity_record_fbo">Record GL app</string>
     <string name="action_settings">Settings</string>
