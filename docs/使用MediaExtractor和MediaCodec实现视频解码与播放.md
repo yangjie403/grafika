@@ -156,7 +156,7 @@ Surface 的生命周期必须和解码器协调：
 3. Activity 暂停或 Surface 销毁前，应先请求播放器停止，并等待解码线程退出；
 4. 谁创建的 `Surface`，通常由谁负责调用 `release()`。
 
-本项目的 [`PlayMovieActivity`](app/src/main/java/com/android/grafika/PlayMovieActivity.java) 在 `SurfaceTexture` 可用后创建 `Surface`，并在 Activity 暂停时等待 `MoviePlayer.PlayTask` 停止。
+本项目的 [`PlayMovieActivity`](../app/src/main/java/com/android/grafika/PlayMovieActivity.java) 在 `SurfaceTexture` 可用后创建 `Surface`，并在 Activity 暂停时等待 `MoviePlayer.PlayTask` 停止。
 
 如果使用文件选择器返回的 `Uri`，可以这样设置数据源：
 
@@ -754,7 +754,7 @@ ByteBuffer inputBuffer = inputBuffers[inputIndex];
 
 输出缓冲区数组还可能因为 `INFO_OUTPUT_BUFFERS_CHANGED` 发生变化，需要重新调用 `getOutputBuffers()`。如果配置为 Surface 输出，一般不会读取输出数组，因此只需处理或忽略该状态即可。
 
-本项目 [`MoviePlayer`](app/src/main/java/com/android/grafika/MoviePlayer.java) 使用的就是这种较早的同步 API；理解它有助于阅读旧版 Android 媒体代码，但新代码应优先使用 API 21+ 的单个缓冲区方法，或者使用 MediaCodec 的异步回调模式。
+本项目 [`MoviePlayer`](../app/src/main/java/com/android/grafika/MoviePlayer.java) 使用的就是这种较早的同步 API；理解它有助于阅读旧版 Android 媒体代码，但新代码应优先使用 API 21+ 的单个缓冲区方法，或者使用 MediaCodec 的异步回调模式。
 
 ## 11. 直接输出 Surface 与读取 YUV 的区别
 
@@ -886,9 +886,9 @@ MediaCodec 的 Surface 输出不需要应用调用 Canvas 绘制。若要清屏�
 
 | 文件 | 作用 |
 | --- | --- |
-| [`MoviePlayer.java`](app/src/main/java/com/android/grafika/MoviePlayer.java) | 使用 `MediaExtractor` 读取视频样本，并使用 `MediaCodec` 输出到 `Surface` |
-| [`PlayMovieActivity.java`](app/src/main/java/com/android/grafika/PlayMovieActivity.java) | 创建 `TextureView`、`Surface` 和 `PlayTask`，管理 UI 与生命周期 |
-| [`SpeedControlCallback.java`](app/src/main/java/com/android/grafika/SpeedControlCallback.java) | 根据 PTS 控制帧提交节奏，也支持固定 60 FPS |
+| [`MoviePlayer.java`](../app/src/main/java/com/android/grafika/MoviePlayer.java) | 使用 `MediaExtractor` 读取视频样本，并使用 `MediaCodec` 输出到 `Surface` |
+| [`PlayMovieActivity.java`](../app/src/main/java/com/android/grafika/PlayMovieActivity.java) | 创建 `TextureView`、`Surface` 和 `PlayTask`，管理 UI 与生命周期 |
+| [`SpeedControlCallback.java`](../app/src/main/java/com/android/grafika/SpeedControlCallback.java) | 根据 PTS 控制帧提交节奏，也支持固定 60 FPS |
 | `PlayMovieSurfaceActivity.java` | 使用 `SurfaceView` 作为另一种输出目标 |
 
 对应的关键代码关系是：
