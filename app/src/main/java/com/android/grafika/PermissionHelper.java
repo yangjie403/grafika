@@ -22,6 +22,7 @@ import android.app.Activity;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.net.Uri;
+import android.os.Build;
 import android.provider.Settings;
 import android.support.v4.app.ActivityCompat;
 import android.support.v4.content.ContextCompat;
@@ -38,6 +39,10 @@ class PermissionHelper {
             Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED;
   }
   public static boolean hasWriteStoragePermission(Activity activity) {
+    // API 29 及以上写入应用专属外部目录不需要存储权限。
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+      return true;
+    }
     return ContextCompat.checkSelfPermission(activity,
             Manifest.permission.WRITE_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED;
   }
@@ -61,6 +66,9 @@ class PermissionHelper {
     }
 
   public static void requestWriteStoragePermission(Activity activity) {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+      return;
+    }
     boolean showRationale = ActivityCompat.shouldShowRequestPermissionRationale(activity,
                     Manifest.permission.WRITE_EXTERNAL_STORAGE);
     if (showRationale) {

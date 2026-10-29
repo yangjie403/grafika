@@ -235,7 +235,8 @@ public class ReadPixelsActivity extends Activity {
                 // save the last one off into a file
                 long startWhen = System.nanoTime();
                 try {
-                    eglSurface.saveFrame(new File(Environment.getExternalStorageDirectory(),
+                    eglSurface.saveFrame(new File(ReadPixelsActivity.this
+                            .getExternalFilesDir(Environment.DIRECTORY_PICTURES),
                             "test.png"));
                 } catch (IOException ioe) {
                     throw new RuntimeException(ioe);

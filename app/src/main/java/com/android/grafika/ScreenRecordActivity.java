@@ -209,8 +209,8 @@ public class ScreenRecordActivity extends PlayMovieSurfaceActivity {
     prepareVideoEncoder(screenWidth, screenHeight);
 
     try {
-      File outputFile = new File(Environment.getExternalStoragePublicDirectory(
-              Environment.DIRECTORY_PICTURES) + "/grafika", "Screen-record-" +
+      File picturesDir = getExternalFilesDir(Environment.DIRECTORY_PICTURES);
+      File outputFile = new File(new File(picturesDir, "grafika"), "Screen-record-" +
               Long.toHexString(System.currentTimeMillis()) + ".mp4");
       if (!outputFile.getParentFile().exists()) {
         outputFile.getParentFile().mkdirs();
