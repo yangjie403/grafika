@@ -35,13 +35,13 @@ class Day03Renderer(private val context: Context) : GLSurfaceView.Renderer {
 
     private val vertices = floatArrayOf(
         // 位置           纹理坐标
-        -1f, 1f, 0f, 0f, 1f,  // 左上
-        -1f, -1f, 0f, 0f, 0f,  // 左下
-        1f, 1f, 0f, 1f, 1f,  // 右上
+        -1f, 1f, 0f, -1f, 2f,  // 左上
+        -1f, -1f, 0f, -1f, -1f,  // 左下
+        1f, 1f, 0f, 2f, 2f,  // 右上
 
-        -1f, -1f, 0f, 0f, 0f,  // 左下
-        1f, -1f, 0f, 1f, 0f,  // 右下
-        1f, 1f, 0f, 1f, 1f   // 右上
+        -1f, -1f, 0f, -1f, -1f,  // 左下
+        1f, -1f, 0f, 2f, -1f,  // 右下
+        1f, 1f, 0f, 2f, 2f   // 右上
     )
 
     private lateinit var vertexBuffer: FloatBuffer
@@ -136,12 +136,12 @@ class Day03Renderer(private val context: Context) : GLSurfaceView.Renderer {
         GLES20.glTexParameteri(
             GLES20.GL_TEXTURE_2D,
             GLES20.GL_TEXTURE_WRAP_S,
-            GLES20.GL_CLAMP_TO_EDGE
+            GLES20.GL_MIRRORED_REPEAT
         )
         GLES20.glTexParameteri(
             GLES20.GL_TEXTURE_2D,
             GLES20.GL_TEXTURE_WRAP_T,
-            GLES20.GL_CLAMP_TO_EDGE
+            GLES20.GL_REPEAT
         )
 
         GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bitmap, 0)
