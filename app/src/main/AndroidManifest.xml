@@ -37,7 +37,7 @@
             android:label="@string/app_name" >
         </activity>
         <activity
-            android:name="com.android.grafika.day03.Day03Activity"
+            android:name="com.android.grafika.day04.Day04Activity"
             android:label="@string/app_name"
             android:theme="@style/GLTheme"
             android:exported="true" >
