@@ -62,6 +62,21 @@ class Day06Renderer(private val context: Context) : GLSurfaceView.Renderer {
     private var rotation = 0f
     private var renderMode = RenderMode.CONTINUOUSLY
 
+    private var frameCount = 0
+    private var currentFps = 0f
+    private var lastFpsTimeNs = 0L
+    private var lastStatsReportTimeNs = 0L
+    private val fpsSampleIntervalNs = 500_000_000L
+    private val statsReportIntervalNs = 500_000_000L
+
+    @Volatile
+    private var statsListener: StatsListener? = null
+
+    fun setStatsListener(listener: StatsListener) {
+        this.statsListener = listener
+    }
+
+
     override fun onSurfaceCreated(
         gl: GL10?,
         config: EGLConfig?
@@ -79,6 +94,11 @@ class Day06Renderer(private val context: Context) : GLSurfaceView.Renderer {
         aTexCoordLoc = GLES20.glGetAttribLocation(program, "aTexCoord")
         uMatrixLoc = GLES20.glGetUniformLocation(program, "uMatrix")
         uTextureLoc = GLES20.glGetUniformLocation(program, "uTexture")
+        val now = System.nanoTime()
+        lastFpsTimeNs = now
+        lastStatsReportTimeNs = now
+        frameCount = 0
+        currentFps = 0f
     }
 
     override fun onSurfaceChanged(
@@ -142,5 +162,9 @@ class Day06Renderer(private val context: Context) : GLSurfaceView.Renderer {
     enum class RenderMode {
         CONTINUOUSLY,
         WHEN_DIRTY
+    }
+
+    interface StatsListener {
+        fun onStatsChanged(rotation: Float, fps: Float)
     }
 }
