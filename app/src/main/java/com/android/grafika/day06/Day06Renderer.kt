@@ -12,7 +12,7 @@ import java.nio.FloatBuffer
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
 
-class Day06Renderer(private val context: Context): GLSurfaceView.Renderer {
+class Day06Renderer(private val context: Context) : GLSurfaceView.Renderer {
 
     private val vertexShaderCode = """
         attribute vec4 aPosition;
@@ -59,8 +59,8 @@ class Day06Renderer(private val context: Context): GLSurfaceView.Renderer {
     private val projectionMatrix = FloatArray(16)
     private val mvpMatrix = FloatArray(16)
 
-    var rotation = 0f
-    var renderMode = RenderMode.CONTINUOUSLY
+    private var rotation = 0f
+    private var renderMode = RenderMode.CONTINUOUSLY
 
     override fun onSurfaceCreated(
         gl: GL10?,
@@ -129,6 +129,14 @@ class Day06Renderer(private val context: Context): GLSurfaceView.Renderer {
     fun rotateStep() {
         rotation += 5f
         if (rotation >= 360f) rotation = 0f
+    }
+
+    fun setRenderMode(mode: RenderMode) {
+        this.renderMode = mode
+    }
+
+    fun reset() {
+        this.rotation = 0f
     }
 
     enum class RenderMode {
