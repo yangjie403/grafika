@@ -16,8 +16,12 @@
 
 package com.android.grafika.gles;
 
+import android.content.Context;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.opengl.GLES20;
 import android.opengl.GLES30;
+import android.opengl.GLUtils;
 import android.opengl.Matrix;
 import android.util.Log;
 
@@ -191,6 +195,48 @@ public class GlUtil {
         GlUtil.checkGlError("loadImageTexture");
 
         return textureHandle;
+    }
+
+    public static int createTextureFromRes(Context context, int resourceId) {
+        int[] textureIds = new int[1];
+        GLES20.glGenTextures(1, textureIds, 0);
+        if (textureIds[0] == 0) {
+            throw new RuntimeException("Could not generate a new OpenGL texture object.");
+        }
+
+        BitmapFactory.Options options = new BitmapFactory.Options();
+        options.inScaled = false;
+        Bitmap bitmap = BitmapFactory.decodeResource(context.getResources(), resourceId, options);
+        if (bitmap == null) {
+            throw new RuntimeException("Error loading texture.");
+        }
+
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, textureIds[0]);
+        GLES20.glTexParameteri(
+                GLES20.GL_TEXTURE_2D,
+                GLES20.GL_TEXTURE_MIN_FILTER,
+                GLES20.GL_LINEAR
+        );
+        GLES20.glTexParameteri(
+                GLES20.GL_TEXTURE_2D,
+                GLES20.GL_TEXTURE_MAG_FILTER,
+                GLES20.GL_LINEAR
+        );
+        GLES20.glTexParameteri(
+                GLES20.GL_TEXTURE_2D,
+                GLES20.GL_TEXTURE_WRAP_S,
+                GLES20.GL_MIRRORED_REPEAT
+        );
+        GLES20.glTexParameteri(
+                GLES20.GL_TEXTURE_2D,
+                GLES20.GL_TEXTURE_WRAP_T,
+                GLES20.GL_REPEAT
+        );
+
+        GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bitmap, 0);
+        bitmap.recycle();
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0);
+        return textureIds[0];
     }
 
     /**
