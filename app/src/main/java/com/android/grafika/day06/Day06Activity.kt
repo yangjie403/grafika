@@ -56,9 +56,11 @@ class Day06Activity : AppCompatActivity() {
         )
         controlLayout.setPadding(50, 50, 50, 50)
         rootLayout.addView(controlLayout)
-        renderModeTv = addLabelView(controlLayout, "渲染模式")
-        rotationTv = addLabelView(controlLayout, "旋转角度")
-        fpsTv = addLabelView(controlLayout, "FPS")
+        renderModeTv = addLabelView(controlLayout, "渲染模式：").apply {
+            text = "持续渲染"
+        }
+        rotationTv = addLabelView(controlLayout, "旋转角度：")
+        fpsTv = addLabelView(controlLayout, "FPS：")
         val row = LinearLayout(this).apply {
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
@@ -91,12 +93,14 @@ class Day06Activity : AppCompatActivity() {
                     glSurfaceView.renderMode = GLSurfaceView.RENDERMODE_WHEN_DIRTY
                     stepBt.isEnabled = true
                     renderMode = RenderMode.WHEN_DIRTY
+                    renderModeTv.text = "按需渲染"
                 }
 
                 RenderMode.WHEN_DIRTY -> {
                     glSurfaceView.renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY
                     stepBt.isEnabled = false
                     renderMode = RenderMode.CONTINUOUSLY
+                    renderModeTv.text = "持续渲染"
                 }
             }
             renderer.setRenderMode(mode = renderMode)
@@ -113,6 +117,14 @@ class Day06Activity : AppCompatActivity() {
             }
             glSurfaceView.requestRender()
         }
+        renderer.setStatsListener(object : Day06Renderer.StatsListener {
+            override fun onStatsChanged(rotation: Float, fps: Float) {
+                runOnUiThread {
+                    fpsTv.text = "$fps"
+                    rotationTv.text = "$rotation"
+                }
+            }
+        })
         setContentView(rootLayout)
     }
 

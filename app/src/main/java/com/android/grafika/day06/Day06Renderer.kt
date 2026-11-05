@@ -144,6 +144,7 @@ class Day06Renderer(private val context: Context) : GLSurfaceView.Renderer {
         GLES20.glDisableVertexAttribArray(aPositionLoc)
         GLES20.glDisableVertexAttribArray(aTexCoordLoc)
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
+        updatePerformanceStats()
     }
 
     fun rotateStep() {
@@ -162,6 +163,24 @@ class Day06Renderer(private val context: Context) : GLSurfaceView.Renderer {
     enum class RenderMode {
         CONTINUOUSLY,
         WHEN_DIRTY
+    }
+
+    private fun updatePerformanceStats() {
+        val now = System.nanoTime()
+
+        frameCount ++
+        val fpsElapsed = now - lastFpsTimeNs
+        if (fpsElapsed >= fpsSampleIntervalNs) {
+            currentFps = frameCount * 1_000_000_000f / fpsElapsed
+            frameCount = 0
+            lastFpsTimeNs = now
+        }
+
+        val reportElapsed = now - lastStatsReportTimeNs
+        if (reportElapsed >= statsReportIntervalNs) {
+            statsListener?.onStatsChanged(rotation, currentFps)
+            lastStatsReportTimeNs = now
+        }
     }
 
     interface StatsListener {
