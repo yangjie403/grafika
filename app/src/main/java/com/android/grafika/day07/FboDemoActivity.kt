@@ -12,7 +12,7 @@ class FboDemoActivity: AppCompatActivity() {
         super.onCreate(savedInstanceState)
         glView = GLSurfaceView(this).apply {
             setEGLContextClientVersion(2)
-            setRenderer(FboRenderer())
+            setRenderer(FboRenderer(this@FboDemoActivity))
             renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY
         }
         setContentView(glView)
