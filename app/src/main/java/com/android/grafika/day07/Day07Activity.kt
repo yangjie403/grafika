@@ -1,8 +1,8 @@
 package com.android.grafika.day07
 
+import android.opengl.GLSurfaceView
 import android.os.Bundle
 import android.support.v7.app.AppCompatActivity
-import android.view.SurfaceView
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
@@ -15,17 +15,22 @@ class Day07Activity : AppCompatActivity() {
     private var blurBt: Button? = null
     private var edgeBt: Button? = null
     private var revertBt: Button? = null
-    private var surfaceView: SurfaceView? = null
+    private lateinit var surfaceView: GLSurfaceView
+    private lateinit var renderer: Day07Renderer
 
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        surfaceView = SurfaceView(this).apply {
+        renderer = Day07Renderer(this)
+        surfaceView = GLSurfaceView(this).apply {
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 0,
                 1f
             )
+            setEGLContextClientVersion(2)
+            setRenderer(renderer)
+            renderMode = GLSurfaceView.RENDERMODE_WHEN_DIRTY
         }
         val rootLayout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -68,6 +73,10 @@ class Day07Activity : AppCompatActivity() {
             text = "原图"
             setOnClickListener {
                 typeTv?.text = "原图"
+                surfaceView.queueEvent {
+                    renderer.setFilterType(Day07Renderer.FILTER_ORIGINAL)
+                }
+                surfaceView.requestRender()
             }
         }
 
@@ -75,6 +84,10 @@ class Day07Activity : AppCompatActivity() {
             text = "灰度图"
             setOnClickListener {
                 typeTv?.text = "灰度图"
+                surfaceView.queueEvent {
+                    renderer.setFilterType(Day07Renderer.FILTER_GRAYSCALE)
+                }
+                surfaceView.requestRender()
             }
         }
 
@@ -82,6 +95,10 @@ class Day07Activity : AppCompatActivity() {
             text = "模糊图"
             setOnClickListener {
                 typeTv?.text = "模糊图"
+                surfaceView.queueEvent {
+                    renderer.setFilterType(Day07Renderer.FILTER_BLUR)
+                }
+                surfaceView.requestRender()
             }
         }
 
@@ -89,6 +106,10 @@ class Day07Activity : AppCompatActivity() {
             text = "边缘图"
             setOnClickListener {
                 typeTv?.text = "边缘图"
+                surfaceView.queueEvent {
+                    renderer.setFilterType(Day07Renderer.FILTER_EDGE)
+                }
+                surfaceView.requestRender()
             }
         }
 
@@ -96,6 +117,10 @@ class Day07Activity : AppCompatActivity() {
             text = "反色"
             setOnClickListener {
                 typeTv?.text = "反色"
+                surfaceView.queueEvent {
+                    renderer.setFilterType(Day07Renderer.FILTER_REVERT)
+                }
+                surfaceView.requestRender()
             }
         }
 
