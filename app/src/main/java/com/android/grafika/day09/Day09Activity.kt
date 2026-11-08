@@ -8,11 +8,15 @@ import android.os.Bundle
 import android.provider.MediaStore
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
+import androidx.camera.core.CameraEffect
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
+import androidx.camera.core.resolutionselector.AspectRatioStrategy
+import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.view.CameraController
 import androidx.camera.view.LifecycleCameraController
+import androidx.camera.view.PreviewView
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.android.grafika.databinding.ActivityDay09CameraBinding
@@ -24,10 +28,9 @@ import java.util.concurrent.Executors
 class Day09Activity : AppCompatActivity() {
 
     private lateinit var viewBinding: ActivityDay09CameraBinding
-
-    private var imageCapture: ImageCapture? = null
     private lateinit var cameraController: LifecycleCameraController
-    private lateinit var cameraExecutor: ExecutorService
+    private lateinit var glSurfaceProcessor: GlSurfaceProcessor
+    private var isFrontCamera = false
     private var cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
 
     @Volatile
@@ -44,7 +47,6 @@ class Day09Activity : AppCompatActivity() {
         } else {
             ActivityCompat.requestPermissions(this, REQUIRED_PERMISSIONS, REQUEST_CODE_PERMISSIONS)
         }
-        cameraExecutor = Executors.newSingleThreadExecutor()
         viewBinding.imageCaptureButton.isEnabled = false
         viewBinding.switchCamera.isEnabled = false
         viewBinding.imageCaptureButton.setOnClickListener {
@@ -61,10 +63,17 @@ class Day09Activity : AppCompatActivity() {
     }
 
     private fun startCamera() {
+        glSurfaceProcessor = GlSurfaceProcessor()
+
+        val grayScaleEffect = CameraFilterEffect(
+            executor = glSurfaceProcessor.executor,
+            processor = glSurfaceProcessor
+        )
+
         cameraController = LifecycleCameraController(this).apply {
             setEnabledUseCases(CameraController.IMAGE_CAPTURE)
             cameraSelector = this@Day09Activity.cameraSelector
-            bindToLifecycle(this@Day09Activity)
+            setEffects(setOf<CameraEffect>(grayScaleEffect))
         }
         // viewBinding.viewFinder.scaleType = PreviewView.ScaleType.FIT_CENTER
         viewBinding.viewFinder.controller = cameraController
@@ -136,8 +145,12 @@ class Day09Activity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
-        cameraExecutor.shutdown()
-        cameraController.unbind()
+        if (::cameraController.isInitialized) {
+            cameraController.unbind()
+        }
+        if (::glSurfaceProcessor.isInitialized) {
+            glSurfaceProcessor.shutdown()
+        }
         super.onDestroy()
     }
 
