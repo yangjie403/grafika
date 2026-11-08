@@ -3,7 +3,7 @@ package com.android.grafika.day04
 import android.graphics.Color
 import android.opengl.GLSurfaceView
 import android.os.Bundle
-import android.support.v7.app.AppCompatActivity
+import androidx.appcompat.app.AppCompatActivity
 import android.view.Gravity
 import android.widget.FrameLayout
 import android.widget.LinearLayout

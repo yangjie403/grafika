@@ -2,7 +2,7 @@ package com.android.grafika.day05
 
 import android.opengl.GLSurfaceView
 import android.os.Bundle
-import android.support.v7.app.AppCompatActivity
+import androidx.appcompat.app.AppCompatActivity
 import android.view.MotionEvent
 import kotlin.math.atan2
 import kotlin.math.hypot
