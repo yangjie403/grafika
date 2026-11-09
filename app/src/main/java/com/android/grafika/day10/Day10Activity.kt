@@ -11,6 +11,7 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.android.grafika.databinding.ActivityDay10Binding
 import java.util.concurrent.Executors
@@ -49,7 +50,23 @@ class Day10Activity : AppCompatActivity() {
         glSurfaceView.renderMode = GLSurfaceView.RENDERMODE_WHEN_DIRTY
 
         btnSwitchCamera = binding.btnSwitchCamera
+        btnSwitchCamera.setOnClickListener {
+            switchCamera()
+        }
 
+        if (allPermissionGranted()) {
+            cameraExecutor.execute {
+                try {
+                    val surface = renderer.getSurfaceTexture()
+                    runOnUiThread {
+                        startCamera(surface)
+                    }
+                } catch (_: Exception) {
+                }
+            }
+        } else {
+            ActivityCompat.requestPermissions(this, REQUIRED_PERMISSIONS, REQUEST_CODE_PERMISSIONS)
+        }
     }
 
     private fun startCamera(surfaceTexture: SurfaceTexture) {
@@ -103,14 +120,37 @@ class Day10Activity : AppCompatActivity() {
         ContextCompat.checkSelfPermission(baseContext, it) == PackageManager.PERMISSION_GRANTED
     }
 
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String?>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == REQUEST_CODE_PERMISSIONS) {
+            if (allPermissionGranted()) {
+                cameraExecutor.execute {
+                    try {
+                        val surfaceTexture = renderer.getSurfaceTexture()
+                        runOnUiThread {
+                            startCamera(surfaceTexture)
+                        }
+                    } catch (_: Exception) {
+                    }
+                }
+            } else {
+                finish()
+            }
+        }
+    }
+
     override fun onResume() {
         super.onResume()
         glSurfaceView.onResume()
     }
 
     override fun onPause() {
-        super.onPause()
         glSurfaceView.onPause()
+        super.onPause()
     }
 
     override fun onDestroy() {

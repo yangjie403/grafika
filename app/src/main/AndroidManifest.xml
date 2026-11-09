@@ -41,7 +41,7 @@
             android:name="com.android.grafika.MainActivity"
             android:label="@string/app_name"></activity>
         <activity
-            android:name="com.android.grafika.day09.Day09Activity"
+            android:name="com.android.grafika.day10.Day10Activity"
             android:exported="true"
             android:label="@string/app_name"
             android:theme="@style/GLTheme">
