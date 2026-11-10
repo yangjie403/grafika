@@ -4,7 +4,7 @@
 >
 > 本文中的代码是供读者在独立示例工程中创建的完整教学实现，包名统一为 `com.example.camerafilter`。它不依赖 Grafika 的 `GlUtil`、`EglCore` 等工具类。项目现有 `day09` 代码可用来对照，但本文不直接改动那些源码。
 
-校验范围：四个完整 Kotlin 类已使用 Android 35 平台类和 CameraX 1.4.2 依赖进行独立编译检查；录像、Controller 和分析坐标映射中使用的 API 也已编译核对。未执行真机 GPU 渲染验证，shader 驱动编译、画面方向、录像与设备兼容性请按第 19 节实测。
+校验范围：四个完整 Kotlin 类已使用 Android 35 平台类和 CameraX 1.4.2 依赖进行独立编译检查；录像、Controller 和分析坐标映射中使用的 API 也已编译核对。第 21 节的 100 个 Android 方法签名/重载已通过平台类编译核对，覆盖正文原有的全部 56 个 EGL/GLES 调用。未执行真机 GPU 渲染验证，shader 驱动编译、画面方向、录像与设备兼容性请按第 19 节实测。
 
 ## 阅读路线
 
@@ -13,6 +13,7 @@
 3. 第 8～11 节：逐步解释 SurfaceProcessor、EGL、GLES、坐标矩阵和释放流程。
 4. 第 12～16 节：动态滤镜、录像、FBO、多通道处理、LUT、水印与拍照。
 5. 第 17～20 节：API 速查、排错、验证和源码查证。
+6. 第 21 节：逐个查询 GL 相关 API 的签名、全部参数、返回值、使用步骤和错误条件。读代码时遇到不认识的调用，可以直接在这一节搜索方法名。
 
 第一遍可以先复制完整类，让画面出现；第二遍按每帧的数据流回看 GLES 调用。真正需要记住的是对象的职责、线程和资源所有权，GL 函数名可以随时查表。
 
@@ -1861,6 +1862,8 @@ release future 未完成时，先检查是否仍绑定其他使用此处理器�
 
 ## 18. API 速查和常见故障
 
+本节用于快速定位。需要了解每个函数的全部参数与调用示例，请查第 21 节的完整 API 说明。
+
 ### 18.1 SurfaceTexture 与 EGL 速查
 
 | API | 调用线程 / 上下文要求 | 最易误用之处 |
@@ -2004,3 +2007,1833 @@ release future 未完成时，先检查是否仍绑定其他使用此处理器�
 - [着色器代码编写指南](着色器代码编写指南.md)
 - [着色器参数传递指南](着色器参数传递指南.md)
 - [安卓图形矩阵使用指南](安卓图形矩阵使用指南.md)
+
+## 21. GL 相关 API 的完整参数与使用说明
+
+本节覆盖**本文完整实现和扩展步骤涉及的 EGL14、EGLExt、GLES20 API**，并补充直接相关的 SurfaceTexture、GLUtils、矩阵、VBO 和 GLSL 函数。按真实数据流分类，避免只解释 `glDrawArrays()`，却跳过纹理、程序和状态的准备过程。
+
+每个函数都给出 Android Java 签名，方便核对 IDE 提示。使用 Kotlin 调用同样的静态方法即可；签名里的 `void` 表示没有返回值，`int[]` 对应 Kotlin `IntArray`，`float[]` 对应 `FloatArray`。
+
+### 21.1 读 API 前先统一这些规则
+
+#### 21.1.1 名称、位置、枚举和偏移不是同一种整数
+
+| 类型 | 例子 | 含义 |
+|---|---|---|
+| GL 对象名称 | textureId、program、shader、framebufferId、bufferId | GL 管理的对象标识，各类对象有各自的名称空间，不能混用 |
+| program 内变量位置 | uniformLocation、attributeLocation | 某个已链接 program 中变量的位置，重新链接后需要重新查询 |
+| 枚举常量 | `GL_TEXTURE_2D`、`GL_FLOAT` | 指定 API 的类型或模式，不是对象 ID |
+| 纹理单元索引 | 0、1 | sampler 指向的单元；与 `GL_TEXTURE0` 枚举区分 |
+| Java 数组 offset | `paramsOffset`、`mOffset` | 以数组**元素数**计数，不以字节计数 |
+| Buffer position | FloatBuffer.position、ByteBuffer.position | 以该 Buffer 的元素类型计数，例如 FloatBuffer 中一个位置是一个 float |
+| VBO offset / stride / size | 顶点字节偏移、步长、缓冲大小 | 以**字节**计数，与数组 offset 不同 |
+
+`0` 也因 API 而异：纹理 0 表示解除命名纹理绑定，framebuffer 0 表示默认绘制目标，program 0 表示不使用有效着色程序，sampler 的值 0 却表示纹理单元 0。不能把它们统称为“空”。
+
+#### 21.1.2 很多函数没有显式传入被修改的对象
+
+`glTexParameteri()` 修改当前纹理单元、指定 target 上绑定的纹理；`glUniform1f()` 修改当前 program；`glReadPixels()` 读取当前 framebuffer。它们依赖**绑定状态**，必须先执行对应 bind/use。
+
+```text
+修改纹理参数：glActiveTexture → glBindTexture → glTexParameteri
+修改程序参数：glUseProgram → glUniform*
+修改离屏附件：glBindFramebuffer → glFramebufferTexture2D
+绘制到窗口：eglMakeCurrent → glBindFramebuffer(..., 0) → draw → swap
+```
+
+`eglMakeCurrent()` 不会清空旧的 GL 状态；切换窗口后，绑定的 FBO、program、纹理单元和 viewport 仍需按当前 pass 的需要设置。
+
+#### 21.1.3 查询和绘制的前置条件
+
+除 EGL 环境创建/查询外，本节 GLES20 示例默认在 **GL 线程、正确 EGLContext 已 current** 的条件下执行。Java 方法能够返回，不代表驱动一定接受了这次调用；创建/链接状态要显式检查，其他调用在调试检查点使用 `glGetError()`。
+
+Android 数组重载通常显式传 offset；Buffer 重载从当前 position 访问，需保证 remaining 足够。下面主要详解本文用到的数组重载，另在需要时说明 Buffer 与 VBO 版本的差别。
+
+### 21.2 能力、状态和错误查询
+
+#### 21.2.1 glGetString：查询驱动和扩展字符串
+
+```java
+String GLES20.glGetString(int name);
+```
+
+| 参数 / 返回值 | 含义 |
+|---|---|
+| `name` | `GL_VENDOR` 厂商、`GL_RENDERER` 渲染器、`GL_VERSION` GLES 版本、`GL_SHADING_LANGUAGE_VERSION` GLSL 版本或 `GL_EXTENSIONS` 扩展列表 |
+| 返回值 | 对应字符串；失败或没有有效上下文时不能依赖它一定非空 |
+
+```kotlin
+val rendererName = GLES20.glGetString(GLES20.GL_RENDERER)
+val extensions = GLES20.glGetString(GLES20.GL_EXTENSIONS).orEmpty().split(' ')
+check("GL_OES_EGL_image_external" in extensions)
+```
+
+扩展名按完整 token 比较，避免字符串包含导致误判。GL 扩展从这里查询；EGL 扩展从 `eglQueryString()` 查询，二者不是同一份列表。此处是 ES 2.0 的查询用法，ES 3.x 的扩展枚举应按相应版本接口处理。
+
+#### 21.2.2 glGetIntegerv：查询整数状态或能力上限
+
+```java
+void GLES20.glGetIntegerv(int pname, int[] params, int offset);
+```
+
+| 参数 | 含义 |
+|---|---|
+| `pname` | 要查询的状态，如 `GL_MAX_TEXTURE_SIZE`、`GL_MAX_TEXTURE_IMAGE_UNITS`、`GL_MAX_VERTEX_ATTRIBS`、`GL_VIEWPORT` |
+| `params` | **输出数组**，接收结果；不同 pname 返回的元素数量不同 |
+| `offset` | 写入 `params` 的起始元素索引 |
+
+```kotlin
+val limit = IntArray(1)
+GLES20.glGetIntegerv(GLES20.GL_MAX_TEXTURE_SIZE, limit, 0)
+check(width <= limit[0] && height <= limit[0])
+val viewport = IntArray(4)
+GLES20.glGetIntegerv(GLES20.GL_VIEWPORT, viewport, 0)
+// viewport 依次为 x、y、width、height。
+```
+
+该方法无返回值，结果写进数组。尺寸上限满足不等于一定有足够 GPU 内存；分配后仍检查错误。不要为返回 4 个整数的 `GL_VIEWPORT` 只分配 `IntArray(1)`。
+
+#### 21.2.3 glGetShaderPrecisionFormat：查询 shader 浮点精度
+
+```java
+void GLES20.glGetShaderPrecisionFormat(
+        int shadertype, int precisiontype,
+        int[] range, int rangeOffset,
+        int[] precision, int precisionOffset);
+```
+
+| 参数 | 含义 |
+|---|---|
+| `shadertype` | `GL_VERTEX_SHADER` 或 `GL_FRAGMENT_SHADER` |
+| `precisiontype` | 查询的精度类别，如 `GL_HIGH_FLOAT`、`GL_MEDIUM_FLOAT`、`GL_LOW_FLOAT`，整数类则为对应 `*_INT` |
+| `range` | 输出数组，至少容纳从 rangeOffset 开始的 2 个整数，表示可表示范围的指数信息，不是直接的最小/最大浮点值 |
+| `rangeOffset` | 两个范围结果在 range 中的起始索引 |
+| `precision` | 输出数组，接收精度位数信息 |
+| `precisionOffset` | precision 输出位置 |
+
+```kotlin
+val range = IntArray(2)
+val precision = IntArray(1)
+GLES20.glGetShaderPrecisionFormat(
+    GLES20.GL_FRAGMENT_SHADER, GLES20.GL_HIGH_FLOAT,
+    range, 0, precision, 0
+)
+val hasFragmentHighp = precision[0] > 0
+```
+
+ES 2.0 的片元 highp 浮点不是所有设备必须支持，查询后选择 shader 版本或回退算法。它不是通过这个函数把 mediump shader 升级成 highp，还需改变 shader 精度声明并编译。
+
+#### 21.2.4 glGetError：读取 GL 错误标志
+
+```java
+int GLES20.glGetError();
+```
+
+没有参数。返回一个错误码，并清除对应错误标志；`GL_NO_ERROR` 表示当前没有待取出的错误。多个错误可能需要反复读取，返回次序不应用来推断全部调用顺序。
+
+| 常见结果 | 典型原因 |
+|---|---|
+| `GL_INVALID_ENUM` | 枚举不被该参数接受，例如 target 或 pname 错误 |
+| `GL_INVALID_VALUE` | 数值不合法，例如负宽度、错误数量 |
+| `GL_INVALID_OPERATION` | 状态或对象不适合操作，例如 uniform 类型不匹配 |
+| `GL_INVALID_FRAMEBUFFER_OPERATION` | 当前 FBO 不完整却继续绘制/读取 |
+| `GL_OUT_OF_MEMORY` | GPU 分配失败；不要继续假设对象已正常初始化 |
+
+```kotlin
+var error = GLES20.glGetError()
+while (error != GLES20.GL_NO_ERROR) {
+    Log.e("GL", "检查点错误：0x${Integer.toHexString(error)}")
+    error = GLES20.glGetError()
+}
+```
+
+应把检查点放在纹理分配、shader/program 设置和 draw 后，而不是只在帧末读一次再猜哪句出错。EGL 错误使用 `eglGetError()`，不是这里。shader 语法错误还需要 info log，不能只看 GL 错误。
+
+### 21.3 EGL：环境、目标、提交和回收
+
+#### 21.3.1 eglGetDisplay：取得 Display 连接句柄
+
+```java
+EGLDisplay EGL14.eglGetDisplay(int display_id);
+```
+
+| 参数 / 返回值 | 含义 |
+|---|---|
+| `display_id` | 原生显示标识；本文传 `EGL_DEFAULT_DISPLAY` 请求默认图形显示连接 |
+| 返回值 | EGLDisplay，失败为 `EGL_NO_DISPLAY` |
+
+```kotlin
+val display = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY)
+check(display != EGL14.EGL_NO_DISPLAY)
+```
+
+它不是 Android 屏幕 View，也不是 GL 绘制目标。得到句柄后还要 `eglInitialize()`。
+
+#### 21.3.2 eglInitialize：初始化 Display
+
+```java
+boolean EGL14.eglInitialize(
+        EGLDisplay dpy,
+        int[] major, int majorOffset,
+        int[] minor, int minorOffset);
+```
+
+| 参数 | 含义 |
+|---|---|
+| `dpy` | 要初始化的 EGLDisplay |
+| `major` | 输出 EGL 主版本号的数组 |
+| `majorOffset` | 主版本号写入 major 的元素位置 |
+| `minor` | 输出 EGL 次版本号的数组 |
+| `minorOffset` | 次版本号写入 minor 的元素位置 |
+| 返回值 | true 初始化成功，false 失败，应立即查询 EGL 错误 |
+
+```kotlin
+val version = IntArray(2)
+check(EGL14.eglInitialize(display, version, 0, version, 1))
+// version[0]、version[1] 是 EGL 版本，不是 OpenGL ES 版本。
+```
+
+两个输出可以共用一个数组，但 offset 要区分，数组也要足够长。该调用不会创建 EGLContext。
+
+#### 21.3.3 eglQueryString：查询 EGL 的版本和扩展
+
+```java
+String EGL14.eglQueryString(EGLDisplay dpy, int name);
+```
+
+| 参数 / 返回值 | 含义 |
+|---|---|
+| `dpy` | 已初始化的 Display；本文在初始化后查询 |
+| `name` | `EGL_VENDOR`、`EGL_VERSION`、`EGL_EXTENSIONS` 或 `EGL_CLIENT_APIS` |
+| 返回值 | 对应字符串，失败可能为 null，需要查 EGL 错误 |
+
+```kotlin
+val extensions = EGL14.eglQueryString(display, EGL14.EGL_EXTENSIONS)
+    .orEmpty().split(' ')
+check("EGL_ANDROID_recordable" in extensions)
+check("EGL_ANDROID_presentation_time" in extensions)
+```
+
+它查询 EGL 能力，不能用来判断 `GL_OES_EGL_image_external` 是否存在。
+
+#### 21.3.4 eglChooseConfig：按条件筛选配置
+
+```java
+boolean EGL14.eglChooseConfig(
+        EGLDisplay dpy,
+        int[] attrib_list, int attrib_listOffset,
+        EGLConfig[] configs, int configsOffset,
+        int config_size,
+        int[] num_config, int num_configOffset);
+```
+
+| 参数 | 含义 |
+|---|---|
+| `dpy` | 已初始化的 Display |
+| `attrib_list` | 输入属性数组，按 key/value 排列，最后 `EGL_NONE` 终止 |
+| `attrib_listOffset` | 从属性数组哪个元素开始读取；本文 0 |
+| `configs` | 输出配置数组，用来接收符合条件的 EGLConfig |
+| `configsOffset` | 写入 configs 的起始位置 |
+| `config_size` | 允许写入的配置项数量，不是属性数组长度或字节数 |
+| `num_config` | 输出数组，报告此次查询实际返回的配置数量；查询总数模式可先不接收配置 |
+| `num_configOffset` | 数量结果写入 num_config 的位置 |
+| 返回值 | 查询过程是否成功；true 与“至少找到一项”是两件事 |
+
+```kotlin
+val configs = arrayOfNulls<EGLConfig>(1)
+val count = IntArray(1)
+check(EGL14.eglChooseConfig(display, attributes, 0, configs, 0, 1, count, 0))
+check(count[0] > 0)
+val selected = requireNotNull(configs[0])
+```
+
+本文属性要求各颜色通道至少满足指定位数，支持 ES2、Window 和 Pbuffer；`EGL_SURFACE_TYPE` 是位掩码，这里使用 `or`，而属性 key/value 之间用逗号排列。recordable 是选择条件，不是录像开始按钮。
+
+#### 21.3.5 eglCreateContext：创建 GL 上下文
+
+```java
+EGLContext EGL14.eglCreateContext(
+        EGLDisplay dpy, EGLConfig config,
+        EGLContext share_context,
+        int[] attrib_list, int offset);
+```
+
+| 参数 | 含义 |
+|---|---|
+| `dpy` | 已初始化的 Display |
+| `config` | 选中的、支持目标 GL 版本的配置 |
+| `share_context` | 要共享资源的已有上下文；`EGL_NO_CONTEXT` 表示不共享 |
+| `attrib_list` | 上下文属性，如 `EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE` |
+| `offset` | 属性数组起始元素位置 |
+| 返回值 | EGLContext，失败为 `EGL_NO_CONTEXT` |
+
+```kotlin
+val context = EGL14.eglCreateContext(
+    display, config, EGL14.EGL_NO_CONTEXT,
+    intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, EGL14.EGL_NONE), 0
+)
+check(context != EGL14.EGL_NO_CONTEXT)
+```
+
+创建后不会自动成为 current，需要 `eglMakeCurrent()`。共享 context 可共享规范允许的纹理、程序等资源，但并不共享所有绑定状态，也不自动解决跨线程 GPU 同步；FBO 等对象的共享规则需按 GLES 版本核实。
+
+#### 21.3.6 eglCreatePbufferSurface：创建离屏 EGL 目标
+
+```java
+EGLSurface EGL14.eglCreatePbufferSurface(
+        EGLDisplay dpy, EGLConfig config,
+        int[] attrib_list, int offset);
+```
+
+| 参数 | 含义 |
+|---|---|
+| `dpy` | Display |
+| `config` | 必须支持 `EGL_PBUFFER_BIT` 的配置 |
+| `attrib_list` | Pbuffer 属性，本文指定 `EGL_WIDTH=1`、`EGL_HEIGHT=1` 并用 `EGL_NONE` 终止 |
+| `offset` | 属性数组起始位置 |
+| 返回值 | 离屏 EGLSurface，失败为 `EGL_NO_SURFACE` |
+
+```kotlin
+val pbuffer = EGL14.eglCreatePbufferSurface(
+    display, config,
+    intArrayOf(EGL14.EGL_WIDTH, 1, EGL14.EGL_HEIGHT, 1, EGL14.EGL_NONE), 0
+)
+```
+
+宽高单位是像素。它提供 current 目标，不与 PreviewView 自动连接，也不是一个可直接交给 CameraX 的 Android Surface。
+
+#### 21.3.7 eglCreateWindowSurface：包装下游 Android Surface
+
+```java
+EGLSurface EGL14.eglCreateWindowSurface(
+        EGLDisplay dpy, EGLConfig config,
+        Object win, int[] attrib_list, int offset);
+```
+
+| 参数 | 含义 |
+|---|---|
+| `dpy` | Display |
+| `config` | 支持 `EGL_WINDOW_BIT`，且与下游兼容的配置 |
+| `win` | Android Java 包装器接受的原生窗口对象；本文是 `SurfaceOutput.getSurface()` 返回的 `android.view.Surface` |
+| `attrib_list` | 窗口属性；本文只传 `EGL_NONE`，采用默认设置 |
+| `offset` | 属性数组起始位置 |
+| 返回值 | Window EGLSurface；失败为 `EGL_NO_SURFACE`，不支持的 Java 窗口类型还可能触发参数异常 |
+
+```kotlin
+val window = EGL14.eglCreateWindowSurface(
+    display, config, androidSurface, intArrayOf(EGL14.EGL_NONE), 0
+)
+```
+
+参数声明是 Object，不代表可以随便传 View、Bitmap 或 textureId。窗口缓冲尺寸来自底层 Surface，不能靠在这个默认属性列表里写宽高来改变相机输出。
+
+#### 21.3.8 eglMakeCurrent：绑定线程、上下文和绘制目标
+
+```java
+boolean EGL14.eglMakeCurrent(
+        EGLDisplay dpy, EGLSurface draw,
+        EGLSurface read, EGLContext ctx);
+```
+
+| 参数 | 含义 |
+|---|---|
+| `dpy` | 上下文和 Surface 所属的 Display |
+| `draw` | 默认 framebuffer 绘制使用的 EGLSurface |
+| `read` | 默认 framebuffer 读取使用的 EGLSurface；本文与 draw 相同 |
+| `ctx` | 要成为调用线程 current 的上下文 |
+| 返回值 | 绑定成功为 true；失败查 EGL 错误 |
+
+```kotlin
+check(EGL14.eglMakeCurrent(display, output, output, context))
+// 当前线程之后的 GLES 调用使用 context；framebuffer=0 时画到 output。
+```
+
+同一个 context 不能同时 current 在两个线程上。转移前要在原线程解除绑定，不能只把 Kotlin 变量传给新线程。
+
+解除绑定的方法如下：
+
+```kotlin
+EGL14.eglMakeCurrent(
+    display, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT
+)
+```
+
+本例不依赖无 Surface 上下文扩展，因此正常 GL 操作用 Pbuffer 作为落脚点。
+
+#### 21.3.9 eglQuerySurface：查询实际 EGL 目标尺寸
+
+```java
+boolean EGL14.eglQuerySurface(
+        EGLDisplay dpy, EGLSurface surface,
+        int attribute, int[] value, int offset);
+```
+
+| 参数 | 含义 |
+|---|---|
+| `dpy` | Display |
+| `surface` | 被查询的 EGLSurface |
+| `attribute` | 要查询的属性，常见 `EGL_WIDTH`、`EGL_HEIGHT` |
+| `value` | 输出数组，接收一个属性值 |
+| `offset` | value 写入位置 |
+| 返回值 | 查询成功/失败 |
+
+```kotlin
+val width = IntArray(1)
+check(EGL14.eglQuerySurface(display, output, EGL14.EGL_WIDTH, width, 0))
+```
+
+排查 CameraX `SurfaceOutput.size` 与底层缓冲是否一致时有用。它不会设置 viewport，也不会修改 Surface 尺寸。
+
+#### 21.3.10 eglGetCurrentContext / eglGetCurrentDisplay / eglGetCurrentSurface
+
+```java
+EGLContext EGL14.eglGetCurrentContext();
+EGLDisplay EGL14.eglGetCurrentDisplay();
+EGLSurface EGL14.eglGetCurrentSurface(int readdraw);
+```
+
+前两个无参数，查询**调用线程**的 current 对象，没有时分别返回 `EGL_NO_CONTEXT`、`EGL_NO_DISPLAY`。
+
+`eglGetCurrentSurface()` 的 `readdraw` 传 `EGL_DRAW` 或 `EGL_READ`，选择查询当前绘制/读取目标，没有时返回 `EGL_NO_SURFACE`。
+
+```kotlin
+check(EGL14.eglGetCurrentContext() == context)
+check(EGL14.eglGetCurrentSurface(EGL14.EGL_DRAW) == output)
+```
+
+这组查询用于调试线程和目标错误，不表示其他线程也拥有相同 current 状态。
+
+#### 21.3.11 eglPresentationTimeANDROID：设置下一帧提交时间
+
+```java
+boolean EGLExt.eglPresentationTimeANDROID(
+        EGLDisplay dpy, EGLSurface surface, long time);
+```
+
+| 参数 | 含义 |
+|---|---|
+| `dpy` | Display |
+| `surface` | 即将提交帧的输出 EGLSurface |
+| `time` | 下一次 swap 提交帧的展示时间戳，单位纳秒；本文透传刚 update 后的 SurfaceTexture.timestamp |
+| 返回值 | 设置成功/失败；需支持 `EGL_ANDROID_presentation_time` |
+
+```kotlin
+check(EGLExt.eglPresentationTimeANDROID(display, output, timestampNs))
+check(EGL14.eglSwapBuffers(display, output))
+```
+
+它不负责播放、编码或延时等待，也不会自动推算下一帧时间。不同来源的时间戳不能不经设计就拼成一条连续录制时间线。
+
+#### 21.3.12 eglSwapBuffers：提交窗口帧
+
+```java
+boolean EGL14.eglSwapBuffers(EGLDisplay dpy, EGLSurface surface);
+```
+
+| 参数 / 返回值 | 含义 |
+|---|---|
+| `dpy` | Display |
+| `surface` | 已完成绘制、需要提交的窗口 EGLSurface |
+| 返回值 | 提交成功为 true，失败读取 EGL 错误并处理失效输出/上下文 |
+
+通常在画完一帧并设置时间戳后调用。它提交图像到下游队列，可能因消费速度和同步等待阻塞，不保证显示器或编码器已经完整消费该帧。Pbuffer/FBO 中间 pass 不靠它把纹理送给下一 pass，使用同上下文 GL 命令顺序即可。
+
+#### 21.3.13 eglDestroySurface：销毁 EGL 包装
+
+```java
+boolean EGL14.eglDestroySurface(EGLDisplay dpy, EGLSurface surface);
+```
+
+`dpy` 是所属 Display，`surface` 是要销毁的 EGLSurface，返回 true/false。本文先切回 Pbuffer，再销毁输出，避免依赖 current Surface 的延迟销毁行为。
+
+```kotlin
+check(EGL14.eglMakeCurrent(display, pbuffer, pbuffer, context))
+check(EGL14.eglDestroySurface(display, output))
+surfaceOutput.close()
+```
+
+它销毁的是 EGL 对象，不代替 CameraX 的关闭协议，也不等价于 `androidSurface.release()`。GL 中间纹理和 FBO 还需要各自的 glDelete 调用。
+
+#### 21.3.14 eglDestroyContext：销毁上下文
+
+```java
+boolean EGL14.eglDestroyContext(EGLDisplay dpy, EGLContext ctx);
+```
+
+`dpy` 为所属 Display，`ctx` 为上下文，返回操作成功与否。本文完成所有输入归还、GPU 对象清理及解除 current 后调用。
+
+上下文销毁后不能拿旧纹理名称到一个全新、不共享的上下文里使用。若存在共享 context，资源实际寿命还受共享组中其他上下文和引用影响。
+
+#### 21.3.15 eglTerminate：结束 Display 初始化
+
+```java
+boolean EGL14.eglTerminate(EGLDisplay dpy);
+```
+
+唯一参数是此前初始化的 Display，返回 true/false。它属于 EGL 生命周期收尾，不是“清空这一帧”。本文在 Surface 和 Context 处理完之后调用。若进程里其他模块也使用 EGL，必须明确各自的初始化、共享和收尾安排，不要让一个局部模块随意终止公共管理器。
+
+#### 21.3.16 eglReleaseThread：释放当前线程的 EGL 状态
+
+```java
+boolean EGL14.eglReleaseThread();
+```
+
+没有参数，返回 true/false。清理调用线程的 EGL 线程状态，本文在 renderer 完成解绑、对象销毁、terminate 后调用。它不是 `HandlerThread.quitSafely()`，不会替你终止 Android 线程。
+
+#### 21.3.17 eglGetError：读取线程的 EGL 错误
+
+```java
+int EGL14.eglGetError();
+```
+
+没有参数，返回调用线程最近的 EGL 错误并将其恢复为 `EGL_SUCCESS`。EGL 与 GLES 的成功常量不同：EGL 使用 `EGL_SUCCESS`，GL 使用 `GL_NO_ERROR`。
+
+| 错误 | 优先检查 |
+|---|---|
+| `EGL_BAD_DISPLAY` / `EGL_NOT_INITIALIZED` | Display 是否取得并初始化 |
+| `EGL_BAD_CONFIG` / `EGL_BAD_MATCH` | 配置能力、Context 版本、窗口和上下文是否匹配 |
+| `EGL_BAD_CONTEXT` / `EGL_BAD_SURFACE` | 句柄是否已销毁或失效 |
+| `EGL_BAD_NATIVE_WINDOW` | 下游 Android Surface 是否有效 |
+| `EGL_BAD_ACCESS` | context/surface 是否仍被其他线程占用 |
+| `EGL_CONTEXT_LOST` | GPU 上下文丢失，需要走资源重建流程 |
+
+只在 EGL 操作失败后立即读取并记录，避免中间另一个错误覆盖诊断信息。不能在主线程调用它来诊断 GL 线程之前的失败。
+
+### 21.4 纹理：创建、绑定、采样和上传
+
+#### 21.4.1 glGenTextures：生成纹理名称
+
+```java
+void GLES20.glGenTextures(int n, int[] textures, int offset);
+```
+
+| 参数 | 含义 |
+|---|---|
+| `n` | 要生成的纹理名称数量，非负；本文 1 |
+| `textures` | 输出数组，接收 n 个名称，容量至少为 offset+n |
+| `offset` | 写入 textures 的起始元素索引 |
+
+```kotlin
+val names = IntArray(1)
+GLES20.glGenTextures(1, names, 0)
+val textureId = names[0]
+check(textureId != 0)
+```
+
+无返回值，名称写入数组。生成名称不等于已有像素内容：普通二维纹理之后要分配/上传存储；OES 图像来自 SurfaceTexture。名称不能拿来直接当成 sampler 的值。
+
+#### 21.4.2 glActiveTexture：选择当前纹理单元
+
+```java
+void GLES20.glActiveTexture(int texture);
+```
+
+`texture` 是**纹理单元枚举**，如 `GL_TEXTURE0` 或 `GL_TEXTURE0 + 1`。选择后，后续纹理绑定/参数操作作用于该单元。无返回值。
+
+```kotlin
+GLES20.glActiveTexture(GLES20.GL_TEXTURE0 + 1)
+GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, lutTextureId)
+GLES20.glUniform1i(lutLocation, 1)
+```
+
+传入整数 1 不是选择单元 1 的正确方式，传 textureId 也不是。fragment shader 可用单元数量查询 `GL_MAX_TEXTURE_IMAGE_UNITS`，同时关注组合单元上限。
+
+#### 21.4.3 glBindTexture：将纹理对象绑定到当前单元
+
+```java
+void GLES20.glBindTexture(int target, int texture);
+```
+
+| 参数 | 含义 |
+|---|---|
+| `target` | 纹理类别，本文相机为 `GL_TEXTURE_EXTERNAL_OES`，普通图/FBO 为 `GL_TEXTURE_2D` |
+| `texture` | 对应纹理名称；0 表示解除这个 target 的命名纹理绑定 |
+
+```kotlin
+GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, inputTextureId)
+```
+
+首次绑定确定纹理对象的 target 类型，不能把同一个已用于 OES 的名称后来改作 2D。OES 与 2D 可以有不同绑定槽，但 shader 的 sampler 类型必须匹配实际纹理类型。绑定纹理既不上传图像，也不自动选择 program 中的 sampler。
+
+#### 21.4.4 glTexParameteri：设置当前绑定纹理的整数参数
+
+```java
+void GLES20.glTexParameteri(int target, int pname, int param);
+```
+
+| 参数 | 含义 |
+|---|---|
+| `target` | 要修改哪个 target 上当前绑定的纹理，先 bind 正确对象 |
+| `pname` | 修改的采样属性，如 MIN_FILTER、MAG_FILTER、WRAP_S、WRAP_T |
+| `param` | 这个属性的值，合法取值随 pname 和纹理类型变化 |
+
+| pname | 常用 param | 本文为何这样选 |
+|---|---|---|
+| `GL_TEXTURE_MIN_FILTER` | 普通 2D 有 NEAREST、LINEAR 和各 mipmap 模式；OES 只用 NEAREST/LINEAR | `GL_LINEAR` 不要求 mipmap，适合相机缩小采样 |
+| `GL_TEXTURE_MAG_FILTER` | `GL_NEAREST` / `GL_LINEAR` | LINEAR 做放大插值 |
+| `GL_TEXTURE_WRAP_S` | 普通 2D 可 REPEAT、CLAMP_TO_EDGE、MIRRORED_REPEAT；OES 要 CLAMP_TO_EDGE | s 为横向纹理坐标，边缘不卷绕 |
+| `GL_TEXTURE_WRAP_T` | 同上 | t 为纵向纹理坐标，边缘不卷绕 |
+
+```kotlin
+GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, textureId)
+GLES20.glTexParameteri(
+    GLES11Ext.GL_TEXTURE_EXTERNAL_OES,
+    GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR
+)
+```
+
+ES 2.0 中非 2 的幂尺寸普通纹理若无扩展，也应使用无 mipmap 的 MIN_FILTER 和 CLAMP_TO_EDGE。API 还提供 `glTexParameterf(target, pname, float param)`；三个参数语义相同，对整数枚举属性使用 `glTexParameteri()` 更清楚。
+
+#### 21.4.5 glTexImage2D：为普通二维纹理分配或上传像素
+
+```java
+void GLES20.glTexImage2D(
+        int target, int level, int internalformat,
+        int width, int height, int border,
+        int format, int type, Buffer pixels);
+```
+
+| 参数 | 含义 |
+|---|---|
+| `target` | 本文 `GL_TEXTURE_2D`，操作已绑定的普通纹理；不是 OES |
+| `level` | mipmap 层级，0 是原始分辨率；本文只使用 0 |
+| `internalformat` | GPU 存储的基础格式；ES 2.0 本文用 `GL_RGBA`，需与 format 配套 |
+| `width` | 该层级图像宽度，像素数 |
+| `height` | 该层级图像高度，像素数 |
+| `border` | OpenGL ES 必须为 0，不能借它增加边框 |
+| `format` | 输入数据的通道排列基础格式，如 `GL_RGBA`、`GL_RGB` |
+| `type` | 每个像素数据的类型/打包方式，本文 `GL_UNSIGNED_BYTE` 为每通道 8 位 |
+| `pixels` | 原生 Buffer，从当前 position 读取；null 表示只分配存储，内容尚未定义 |
+
+```kotlin
+GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, textureId)
+GLES20.glTexImage2D(
+    GLES20.GL_TEXTURE_2D, 0, GLES20.GL_RGBA,
+    width, height, 0,
+    GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, null
+)
+```
+
+这是 FBO 附件的常用分配方式。null 不意味着黑色，读取前先 clear 或完整绘制。若上传 RGBA 字节，最基本容量是 width×height×4，还要考虑行对齐。对于 ES 2.0，不要套用桌面 GL 或 ES 3.x 的任意 sized internalformat。
+
+#### 21.4.6 glTexSubImage2D：更新已有二维纹理的局部区域
+
+```java
+void GLES20.glTexSubImage2D(
+        int target, int level, int xoffset, int yoffset,
+        int width, int height, int format, int type, Buffer pixels);
+```
+
+| 参数 | 含义 |
+|---|---|
+| `target` | 已绑定纹理类型，本文 `GL_TEXTURE_2D` |
+| `level` | 已存在的 mipmap 层级，本文 0 |
+| `xoffset` / `yoffset` | 写入纹理区域的左下起始 texel 坐标，单位像素，不是 UV |
+| `width` / `height` | 本次更新的矩形像素宽高 |
+| `format` / `type` | 本次输入像素格式和类型，需与已有存储兼容 |
+| `pixels` | 待上传像素 Buffer，容量和行布局要与更新区域匹配 |
+
+```kotlin
+GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, watermarkTextureId)
+GLES20.glTexSubImage2D(
+    GLES20.GL_TEXTURE_2D, 0, 0, 0, patchWidth, patchHeight,
+    GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, patchBytes
+)
+```
+
+它不分配新尺寸；必须先有 `glTexImage2D()` 建立的存储，区域也不能越界。更换同尺寸水印可更新，改变尺寸则重新分配或创建新纹理。
+
+#### 21.4.7 glPixelStorei：设置像素上传/读回的行对齐
+
+```java
+void GLES20.glPixelStorei(int pname, int param);
+```
+
+| 参数 | 含义 |
+|---|---|
+| `pname` | 上传使用 `GL_UNPACK_ALIGNMENT`；读回使用 `GL_PACK_ALIGNMENT` |
+| `param` | 每行对齐字节数，允许 1、2、4、8，默认 4 |
+
+```kotlin
+GLES20.glPixelStorei(GLES20.GL_UNPACK_ALIGNMENT, 1)
+// 上传紧密排列、没有行 padding 的 RGB 或 RGBA 数据。
+GLES20.glPixelStorei(GLES20.GL_PACK_ALIGNMENT, 1)
+// 将 glReadPixels 结果按紧密行布局写入 Buffer。
+```
+
+例如 RGB 宽度 5，一行 15 字节，默认对齐 4 时需要按 16 字节步长提供行。若输入其实每行只有 15 字节却保留默认值，会产生错行。RGBA 每行 width×4，通常天然满足默认对齐。
+
+这两个设置都是 context 状态，不只影响一次调用；与其他模块共同渲染时恢复其期望值。它们不能任意设置行宽，也不能解决 Bitmap 本身不同 rowBytes 的全部问题。
+
+#### 21.4.8 GLUtils.texImage2D：上传 Android Bitmap
+
+```java
+void GLUtils.texImage2D(int target, int level, Bitmap bitmap, int border);
+```
+
+| 参数 | 含义 |
+|---|---|
+| `target` | 已绑定普通纹理，本文 `GL_TEXTURE_2D` |
+| `level` | 层级，本文 0 |
+| `bitmap` | 未 recycle、平台支持其格式的 Bitmap；辅助函数据此选择像素格式和类型 |
+| `border` | GLES 中传 0 |
+
+```kotlin
+GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, watermarkTextureId)
+android.opengl.GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bitmap, 0)
+```
+
+其他重载显式接收 `internalformat`，或同时接收 `internalformat`、`type`；含义与 GLES 上传一致。这个辅助方法不是自动加载图片，也不自动开启 alpha 混合；需要自己设置纹理过滤和 wrap，检查 Bitmap 配置/行布局，验证 UV 上下方向。它也不会替你改变 `GL_UNPACK_ALIGNMENT`，需让该状态与输入 Bitmap 的行布局匹配。
+
+Bitmap 的预乘 alpha 不会因为上传而自动变成未预乘。图片解码可在工作线程完成，GL 上传必须在 GL 线程进行。
+
+#### 21.4.9 GLUtils.texSubImage2D：用 Bitmap 更新已存在纹理
+
+```java
+void GLUtils.texSubImage2D(
+        int target, int level, int xoffset, int yoffset, Bitmap bitmap);
+```
+
+target、level、xoffset、yoffset 与 `glTexSubImage2D()` 相同；bitmap 提供整张更新数据，其宽高决定更新区域。没有返回值，已绑定纹理必须预先有兼容存储。
+
+```kotlin
+android.opengl.GLUtils.texSubImage2D(
+    GLES20.GL_TEXTURE_2D, 0, 0, 0, newWatermarkBitmap
+)
+```
+
+不能用它把原来较小纹理自动扩容。仅内容变化时更新即可，固定水印不需要每帧上传。
+
+#### 21.4.10 glDeleteTextures：回收纹理对象
+
+```java
+void GLES20.glDeleteTextures(int n, int[] textures, int offset);
+```
+
+`n` 为删除数量，`textures` 是**输入数组**保存已有纹理名称，`offset` 指向起始元素。无返回值；0 和不对应现存纹理的名称会被忽略，但应用仍应幂等管理，避免对象名称复用后误删新对象。
+
+```kotlin
+GLES20.glDeleteTextures(1, intArrayOf(textureId), 0)
+```
+
+对应相机输入先等 provideSurface 结果回调，再释放 Surface/SurfaceTexture 和纹理。删除纹理不等于释放 Android 输入 Surface，也不允许你跳过相机所有权契约。
+
+### 21.5 Shader 和 Program：每一步的参数
+
+#### 21.5.1 glCreateShader：创建 shader 对象
+
+```java
+int GLES20.glCreateShader(int type);
+```
+
+`type` 只能选择 shader 阶段，本文 `GL_VERTEX_SHADER` 或 `GL_FRAGMENT_SHADER`。返回 shader 名称，创建失败为 0。
+
+```kotlin
+val shader = GLES20.glCreateShader(GLES20.GL_FRAGMENT_SHADER)
+check(shader != 0)
+```
+
+只创建对象，里面还没有源码，也未编译。这里不能传 program 或 shader 字符串。
+
+#### 21.5.2 glShaderSource：指定源码
+
+```java
+void GLES20.glShaderSource(int shader, String string);
+```
+
+`shader` 为刚创建的 shader 对象；`string` 是完整 GLSL 源码。没有返回值，这一步替换源码，不会编译，也不会改变已经链接 program 的可执行代码。
+
+```kotlin
+GLES20.glShaderSource(shader, fragmentSource)
+```
+
+这是 Android String 包装接口，不需要额外传 C API 的字符串数量、长度或指针数组。OES 扩展声明要放在适当位置，不能在 shader 代码中夹入 Kotlin/Java 声明。
+
+#### 21.5.3 glCompileShader：编译当前源码
+
+```java
+void GLES20.glCompileShader(int shader);
+```
+
+唯一参数是 shader 名称，没有直接返回编译结果。调用后用 `glGetShaderiv()` 查询 `GL_COMPILE_STATUS`，失败时读取 `glGetShaderInfoLog()`。
+
+```kotlin
+GLES20.glCompileShader(shader)
+```
+
+不要每帧编译。新模式尽量通过 uniform 选择，或者提前编译并缓存 program。
+
+#### 21.5.4 glGetShaderiv：查询 shader 编译状态
+
+```java
+void GLES20.glGetShaderiv(int shader, int pname, int[] params, int offset);
+```
+
+| 参数 | 含义 |
+|---|---|
+| `shader` | 被查询的 shader 名称 |
+| `pname` | 常用 `GL_COMPILE_STATUS`，也可查询 `GL_SHADER_TYPE`、`GL_DELETE_STATUS`、日志长度等 |
+| `params` | 输出数组接收结果 |
+| `offset` | 写入结果的元素位置 |
+
+```kotlin
+val status = IntArray(1)
+GLES20.glGetShaderiv(shader, GLES20.GL_COMPILE_STATUS, status, 0)
+check(status[0] == GLES20.GL_TRUE) { GLES20.glGetShaderInfoLog(shader) }
+```
+
+`status[0]` 才是结果，调用本身无返回值。shader 对象有效不代表编译成功。
+
+#### 21.5.5 glGetShaderInfoLog：取得编译诊断
+
+```java
+String GLES20.glGetShaderInfoLog(int shader);
+```
+
+参数是 shader 名称，返回驱动生成的日志字符串。可能有错误、警告或为空。它不返回源码，也不以“日志非空”作为编译成功与否的标准；以 COMPILE_STATUS 判断。
+
+保留日志里的行号并对应实际提交的 shader 文本，特别是运行时拼接了扩展或宏定义时，IDE 文件行号可能与 shader 行号不同。
+
+#### 21.5.6 glCreateProgram：创建 program 对象
+
+```java
+int GLES20.glCreateProgram();
+```
+
+无参数，返回 program 名称，失败为 0。一个 program 将顶点阶段与片元阶段连接为一次 draw 使用的程序。
+
+```kotlin
+val program = GLES20.glCreateProgram()
+check(program != 0)
+```
+
+program 名称不能当 shader 名称传入 compile API。
+
+#### 21.5.7 glAttachShader：把 shader 附加到 program
+
+```java
+void GLES20.glAttachShader(int program, int shader);
+```
+
+`program` 是目标程序对象，`shader` 是某阶段 shader 对象，无返回值。本文分别附加一个编译成功的 vertex shader 和 fragment shader。
+
+```kotlin
+GLES20.glAttachShader(program, vertexShader)
+GLES20.glAttachShader(program, fragmentShader)
+```
+
+attach 不是 link，不保证阶段接口已经匹配。不要交换两个参数。
+
+#### 21.5.8 glLinkProgram：链接两个阶段
+
+```java
+void GLES20.glLinkProgram(int program);
+```
+
+参数是要链接的 program，无直接返回值。检查 `GL_LINK_STATUS`，失败读取 program 日志。varying 的名称/类型必须匹配，采样器及 uniform 的使用也要满足设备限制。
+
+重新链接会影响变量 location 和 uniform 初始化状态。若热更新 shader，建立新 program、查询全部位置并上传参数后再切换，避免继续使用旧 location。
+
+#### 21.5.9 glGetProgramiv：查询链接状态
+
+```java
+void GLES20.glGetProgramiv(int program, int pname, int[] params, int offset);
+```
+
+program 为查询对象；pname 常用 `GL_LINK_STATUS`，还可查询 `GL_ACTIVE_UNIFORMS`、`GL_ACTIVE_ATTRIBUTES`、`GL_INFO_LOG_LENGTH`；params 为输出数组，offset 为写入元素位置。
+
+```kotlin
+val status = IntArray(1)
+GLES20.glGetProgramiv(program, GLES20.GL_LINK_STATUS, status, 0)
+check(status[0] == GLES20.GL_TRUE) { GLES20.glGetProgramInfoLog(program) }
+```
+
+program 创建成功、两个 shader 编译成功，都不能替代链接状态检查。
+
+#### 21.5.10 glGetProgramInfoLog：取得链接诊断
+
+```java
+String GLES20.glGetProgramInfoLog(int program);
+```
+
+参数为 program 名称，返回链接/相关程序诊断日志。查看阶段接口不匹配、资源上限等原因。日志可有警告，最终成功与否仍看 LINK_STATUS。
+
+#### 21.5.11 glUseProgram：选择接下来绘制的 program
+
+```java
+void GLES20.glUseProgram(int program);
+```
+
+`program` 为成功链接的程序，0 解除有效 program 选择，无返回值。GLES2 没有旧式固定管线可供 program=0 正常绘制滤镜。
+
+```kotlin
+GLES20.glUseProgram(program)
+GLES20.glUniform1f(intensityLocation, intensity)
+GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+```
+
+uniform 上传作用于当前 program，因此 use 必须在上传前。选择 program 不会自动绑定它需要的输入纹理、attribute 数组或 FBO。
+
+#### 21.5.12 glGetAttribLocation：查询顶点属性位置
+
+```java
+int GLES20.glGetAttribLocation(int program, String name);
+```
+
+program 为已链接程序，name 为 shader 中的 active attribute 名称，大小写必须一致。返回非负位置；未找到/非活跃等情况为 -1。
+
+```kotlin
+val positionLocation = GLES20.glGetAttribLocation(program, "aPosition")
+check(positionLocation >= 0)
+```
+
+之后把位置传给 enable 和 pointer 函数。优化掉的 attribute 不会得到可用位置，不要拿 -1 继续启用数组。
+
+#### 21.5.13 glGetUniformLocation：查询程序参数位置
+
+```java
+int GLES20.glGetUniformLocation(int program, String name);
+```
+
+program 为已链接程序，name 为 active uniform 名称，例如 `uTexture`、`uTexMatrix`。返回 location，未找到/非活跃时为 -1。数组元素可用相应名字，例如 `uWeights[0]`。
+
+```kotlin
+val samplerLocation = GLES20.glGetUniformLocation(program, "uTexture")
+check(samplerLocation >= 0)
+```
+
+GL 对 location=-1 的 uniform 上传会忽略，但教学实现选择检查，尽早发现拼写/优化问题。attribute 的 -1 不能照这个规则继续使用。
+
+#### 21.5.14 glDeleteShader：标记 shader 删除
+
+```java
+void GLES20.glDeleteShader(int shader);
+```
+
+参数为 shader 名称，0 被忽略，无返回值。shader 若仍被 program 附加，实际删除可能延迟到引用解除。正常链接后调用不会让已经链接好的 program 丢失可执行代码，因此本文 finally 中回收 shader。
+
+#### 21.5.15 glDeleteProgram：回收 program
+
+```java
+void GLES20.glDeleteProgram(int program);
+```
+
+参数为 program 名称，0 被忽略，无返回值。仍作为 current 使用的程序可能延迟实际删除；应用停止使用或切换程序后收尾更清楚。它不删除输入纹理、输出 Surface 或所有 context 状态。
+
+### 21.6 顶点、uniform 与 draw
+
+#### 21.6.1 glEnableVertexAttribArray / glDisableVertexAttribArray
+
+```java
+void GLES20.glEnableVertexAttribArray(int index);
+void GLES20.glDisableVertexAttribArray(int index);
+```
+
+两者唯一参数 index 都是 attribute 位置，范围应落在支持的 attribute 索引内。enable 让 vertex shader 从已描述的数组逐顶点读取；disable 停止使用该数组，改用该索引的常量属性值。都没有返回值。
+
+```kotlin
+GLES20.glEnableVertexAttribArray(positionLocation)
+GLES20.glVertexAttribPointer(positionLocation, 2, GLES20.GL_FLOAT, false, 0, vertices)
+GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+GLES20.glDisableVertexAttribArray(positionLocation)
+```
+
+disable 不是释放 FloatBuffer/VBO，也不是把所有 GL 状态恢复默认。
+
+#### 21.6.2 glVertexAttribPointer：描述顶点数组或 VBO 布局
+
+```java
+void GLES20.glVertexAttribPointer(
+        int indx, int size, int type, boolean normalized,
+        int stride, Buffer ptr);
+void GLES20.glVertexAttribPointer(
+        int indx, int size, int type, boolean normalized,
+        int stride, int offset);
+```
+
+| 参数 | 含义 |
+|---|---|
+| `indx` | 当前 draw 使用的 program attribute 位置 |
+| `size` | 每顶点该属性分量数，1～4；本文位置/UV 都是 2 |
+| `type` | 数据类型，本文 `GL_FLOAT`；与实际 buffer 存储匹配 |
+| `normalized` | 整数输入是否归一化到浮点范围；float 数据时不需要，本文 false |
+| `stride` | 相邻顶点相同属性的起始地址差，单位字节；0 表示该属性紧密排列 |
+| `ptr` | 使用客户端数组的重载：指向顶点数据的 direct Buffer，读取起点是其 position |
+| `offset` | 使用 VBO 的重载：已绑定 GL_ARRAY_BUFFER 内的起始**字节偏移**，不是 Buffer position |
+
+客户端路径先绑定 ARRAY_BUFFER=0，再传 direct FloatBuffer。VBO 路径先 bind 有效 VBO，再传整数 offset。不要在绑定 VBO 时把 Java Buffer 当成其偏移使用。
+
+```kotlin
+// 独立位置数组：每顶点两个 float，stride=0。
+GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, 0)
+vertices.position(0)
+GLES20.glVertexAttribPointer(positionLocation, 2, GLES20.GL_FLOAT, false, 0, vertices)
+
+// VBO 交错布局为 x、y、s、t，每顶点 16 字节，UV 从第 8 字节开始。
+GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, interleavedVbo)
+GLES20.glVertexAttribPointer(positionLocation, 2, GLES20.GL_FLOAT, false, 16, 0)
+GLES20.glVertexAttribPointer(texCoordLocation, 2, GLES20.GL_FLOAT, false, 16, 8)
+```
+
+pointer 描述数据来源，不立即 draw。VBO 绑定会在 pointer 设置时与属性关联；客户端 Buffer 必须在 draw 时仍有效且内容足够。
+
+#### 21.6.3 glUniform1f：上传一个浮点参数
+
+```java
+void GLES20.glUniform1f(int location, float x);
+```
+
+location 是当前 program 的 float uniform 位置，x 是值。无返回值。示例 intensity 限制在 0～1：
+
+```kotlin
+GLES20.glUseProgram(program)
+GLES20.glUniform1f(intensityLocation, intensity.coerceIn(0f, 1f))
+```
+
+函数自身不会把值限制到 0～1；参数合法范围由算法定义。uniform 保存在 program 中，后续 draw 沿用，直到再次上传或程序重新链接。
+
+#### 21.6.4 glUniform1i：上传整数或 sampler 单元
+
+```java
+void GLES20.glUniform1i(int location, int x);
+```
+
+location 为当前 program 的整数/bool/sampler uniform 位置；x 为整数值。sampler 必须用整数接口，x 是纹理单元索引，本文 0；mode 则是算法模式编号。
+
+```kotlin
+GLES20.glUniform1i(samplerLocation, 0)
+GLES20.glUniform1i(modeLocation, 2)
+```
+
+float uniform 与整数上传接口不匹配会出错，不是所有 uniform 都能用 1i 传。sampler 不接受纹理名称或 `GL_TEXTURE0` 枚举值。
+
+#### 21.6.5 glUniform2f / glUniform3f / glUniform4f：上传向量
+
+```java
+void GLES20.glUniform2f(int location, float x, float y);
+void GLES20.glUniform3f(int location, float x, float y, float z);
+void GLES20.glUniform4f(int location, float x, float y, float z, float w);
+```
+
+location 为当前 program 中对应 vec2/vec3/vec4 的位置，后续实参依次为向量分量，均无返回值。不能给 vec2 uniform 用 glUniform1f 上传。
+
+```kotlin
+// 模糊横向采样间距，必须使用被采样纹理的实际尺寸。
+GLES20.glUniform2f(stepLocation, 1f / sourceWidth, 0f)
+// 三通道增益。
+GLES20.glUniform3f(gainLocation, redGain, greenGain, blueGain)
+// RGBA 常量颜色。
+GLES20.glUniform4f(colorLocation, 1f, 0f, 0f, 0.5f)
+```
+
+GLSL 向量名称 x/y/z/w 和 r/g/b/a 可描述相同分量，但实际用途由 shader 决定，不是 API 自动判断颜色。
+
+#### 21.6.6 glUniform1fv / glUniform2fv / glUniform3fv / glUniform4fv
+
+```java
+void GLES20.glUniform1fv(int location, int count, float[] v, int offset);
+void GLES20.glUniform2fv(int location, int count, float[] v, int offset);
+void GLES20.glUniform3fv(int location, int count, float[] v, int offset);
+void GLES20.glUniform4fv(int location, int count, float[] v, int offset);
+```
+
+| 参数 | 含义 |
+|---|---|
+| `location` | 对应 uniform 或 uniform 数组首个待写元素的位置 |
+| `count` | 上传的标量/向量**个数**，不是 float 总数 |
+| `v` | 输入浮点数组，依次排列；Nfv 需要 count×N 个 float |
+| `offset` | 从 v 哪个 float 元素开始读 |
+
+```kotlin
+// uniform float uWeights[5]：count=5，需要 5 个 float。
+GLES20.glUniform1fv(weightsLocation, 5, weights, 0)
+// uniform vec2 uOffsets[3]：count=3，需要 6 个 float。
+GLES20.glUniform2fv(offsetsLocation, 3, floatArrayOf(-1f, 0f, 0f, 0f, 1f, 0f), 0)
+```
+
+上传多个值要求对应的是有足够元素的数组 uniform。上述浮点接口另有 FloatBuffer 重载，从其 position 读取；不要把 count 写成数组总长度，尤其 vec4 数组。
+
+#### 21.6.7 glUniformMatrix4fv：上传 4×4 矩阵
+
+```java
+void GLES20.glUniformMatrix4fv(
+        int location, int count, boolean transpose,
+        float[] value, int offset);
+```
+
+| 参数 | 含义 |
+|---|---|
+| `location` | 当前 program 中 mat4 uniform 的位置 |
+| `count` | 上传的 mat4 数量，本文 1，不是 16 |
+| `transpose` | OpenGL ES 要求 false，直接按列主序使用 |
+| `value` | 输入数组，每个 mat4 连续 16 个 float，至少满足 offset+count×16 |
+| `offset` | 输入数组起始 float 元素索引 |
+
+```kotlin
+GLES20.glUniformMatrix4fv(matrixLocation, 1, false, outputMatrix, 0)
+```
+
+SurfaceTexture 和 android.opengl.Matrix 的 4×4 数组可按此格式上传；不要把 Android graphics.Matrix 的 9 个值传进来，也不要把 transpose 设 true 来修正自己排错的数组。
+
+#### 21.6.8 glDrawArrays：从顺序顶点绘制图元
+
+```java
+void GLES20.glDrawArrays(int mode, int first, int count);
+```
+
+| 参数 | 含义 |
+|---|---|
+| `mode` | 图元组织方式，本文 `GL_TRIANGLE_STRIP`，其他有 TRIANGLES、LINES、POINTS 等 |
+| `first` | 从属性数组中的哪个顶点开始，本文 0，单位顶点索引 |
+| `count` | 读取的顶点数，本文 4，不是 float 数或三角形数 |
+
+```kotlin
+GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+```
+
+调用前必须准备 current program、目标 framebuffer、viewport、attribute、uniform 与纹理。它把 GPU 工作排入命令流，不自动 swap，不返回处理后的 Bitmap。
+
+#### 21.6.9 glDrawElements：按索引绘制
+
+```java
+void GLES20.glDrawElements(int mode, int count, int type, Buffer indices);
+void GLES20.glDrawElements(int mode, int count, int type, int offset);
+```
+
+| 参数 | 含义 |
+|---|---|
+| `mode` | 图元模式，例如 `GL_TRIANGLES` |
+| `count` | 本次索引个数，矩形两个三角形通常 6 |
+| `type` | 索引元素类型；基础 ES 2.0 用 `GL_UNSIGNED_BYTE` 或 `GL_UNSIGNED_SHORT`，32 位索引需额外能力 |
+| `indices` | 客户端索引数据 direct Buffer，ELEMENT_ARRAY_BUFFER 应为 0 |
+| `offset` | VBO 索引路径中，已绑定 ELEMENT_ARRAY_BUFFER 内的起始字节偏移 |
+
+```kotlin
+val indices = ByteBuffer.allocateDirect(6 * 2)
+    .order(ByteOrder.nativeOrder()).asShortBuffer()
+    .apply { put(shortArrayOf(0, 1, 2, 2, 1, 3)); position(0) }
+GLES20.glBindBuffer(GLES20.GL_ELEMENT_ARRAY_BUFFER, 0)
+GLES20.glDrawElements(GLES20.GL_TRIANGLES, 6, GLES20.GL_UNSIGNED_SHORT, indices)
+```
+
+索引指向之前定义的顶点属性，不能超出属性数据范围。客户端/索引 VBO 两种路径不能混淆。本文简单矩形不必改为索引绘制，复杂网格再考虑。
+
+### 21.7 绘制区域、清屏与混合状态
+
+#### 21.7.1 glViewport：将 NDC 映射到输出像素区域
+
+```java
+void GLES20.glViewport(int x, int y, int width, int height);
+```
+
+| 参数 | 含义 |
+|---|---|
+| `x` / `y` | viewport 左下角在当前 framebuffer 中的像素位置 |
+| `width` / `height` | viewport 像素宽高，不能为负 |
+
+```kotlin
+GLES20.glViewport(0, 0, outputWidth, outputHeight)
+```
+
+NDC (-1,-1) 映射到左下，(1,1) 映射到右上。函数不改变纹理或 EGLSurface 的实际尺寸，也不等价于裁剪区域；clear 的范围不由 viewport 决定。多 pass 切换尺寸时必须更新。
+
+#### 21.7.2 glClearColor：设置之后清颜色缓冲使用的颜色
+
+```java
+void GLES20.glClearColor(float red, float green, float blue, float alpha);
+```
+
+四个参数是 RGBA 清屏颜色分量，通常按 0～1 表示，在本文 RGBA8 场景中使用相应范围；alpha=1 为不透明，0 为透明。
+
+```kotlin
+GLES20.glClearColor(0f, 0f, 0f, 1f)
+```
+
+仅设置状态，没有立即写入 framebuffer。清为透明不代表 PreviewView 所在窗口和视频编码器能保留透明；下游是否支持 alpha 是另一个问题。
+
+#### 21.7.3 glClear：清除指定缓冲
+
+```java
+void GLES20.glClear(int mask);
+```
+
+mask 是位掩码，可用 `GL_COLOR_BUFFER_BIT`、`GL_DEPTH_BUFFER_BIT`、`GL_STENCIL_BUFFER_BIT` 组合。本文只需要颜色缓冲：
+
+```kotlin
+GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+// 若有深度附件并需要同时清除：
+GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT or GLES20.GL_DEPTH_BUFFER_BIT)
+```
+
+它清当前 framebuffer，不清所有纹理或 GL 状态。clear 会受 scissor 和相应写入 mask 影响，不受 viewport 限制；开启 scissor 后只清 scissor 范围。滤镜完整覆盖颜色缓冲时可评估省略 clear。
+
+#### 21.7.4 glEnable / glDisable：开关流水线能力
+
+```java
+void GLES20.glEnable(int cap);
+void GLES20.glDisable(int cap);
+```
+
+cap 是可启停的能力枚举，例如 `GL_BLEND`、`GL_DEPTH_TEST`、`GL_SCISSOR_TEST`、`GL_CULL_FACE`。没有返回值，设置保持到之后再次修改。
+
+```kotlin
+GLES20.glDisable(GLES20.GL_BLEND)
+GLES20.glDisable(GLES20.GL_DEPTH_TEST)
+GLES20.glDisable(GLES20.GL_SCISSOR_TEST)
+```
+
+cap 不能传 textureId、uniformLocation 或 `GL_TEXTURE_2D`；GLES2 纹理采样由 shader 决定，不靠旧式 `glEnable(GL_TEXTURE_2D)`。顶点属性开关使用专门的 `glEnableVertexAttribArray()`。
+
+#### 21.7.5 glScissor：限制可写入的矩形
+
+```java
+void GLES20.glScissor(int x, int y, int width, int height);
+```
+
+x/y 为当前 framebuffer 的左下起始像素坐标，width/height 为矩形宽高，不能为负。只设置 scissor 矩形，需 `glEnable(GL_SCISSOR_TEST)` 才生效。
+
+```kotlin
+GLES20.glEnable(GLES20.GL_SCISSOR_TEST)
+GLES20.glScissor(0, 0, outputWidth / 2, outputHeight)
+// 后续 draw/clear 只影响左半边，用于滤镜前后对比。
+GLES20.glDisable(GLES20.GL_SCISSOR_TEST)
+```
+
+viewport 描述坐标映射，scissor 描述写入限制。要从 Android 顶部原点矩形转换为 GL 底部原点，使用 `glY = framebufferHeight - top - rectHeight`。
+
+#### 21.7.6 glBlendFunc：指定源色和目标色的混合系数
+
+```java
+void GLES20.glBlendFunc(int sfactor, int dfactor);
+```
+
+| 参数 | 含义 |
+|---|---|
+| `sfactor` | 源颜色系数；源是当前 fragment shader 输出 |
+| `dfactor` | 目标颜色系数；目标是 framebuffer 中已有颜色 |
+
+在默认相加混合方程下，概念上 `result = source × sfactor + destination × dfactor`。常见系数为 `GL_ONE`、`GL_ZERO`、`GL_SRC_ALPHA`、`GL_ONE_MINUS_SRC_ALPHA`。
+
+```kotlin
+GLES20.glEnable(GLES20.GL_BLEND)
+// 预乘 alpha 水印：shader 的 RGB 已含 alpha。
+GLES20.glBlendFunc(GLES20.GL_ONE, GLES20.GL_ONE_MINUS_SRC_ALPHA)
+```
+
+未预乘颜色常用 SRC_ALPHA / ONE_MINUS_SRC_ALPHA 混合 RGB；若同时需要准确保留目标 alpha，用下面的 Separate 接口分别配置。设置 blend func 不会自动 enable blending。
+
+#### 21.7.7 glBlendFuncSeparate：分别设置 RGB 和 alpha 系数
+
+```java
+void GLES20.glBlendFuncSeparate(
+        int srcRGB, int dstRGB, int srcAlpha, int dstAlpha);
+```
+
+srcRGB/dstRGB 分别控制 RGB 源/目标系数，srcAlpha/dstAlpha 分别控制 alpha 源/目标系数。没有返回值。
+
+```kotlin
+// 未预乘 RGB，alpha 按 source-over 累积。
+GLES20.glBlendFuncSeparate(
+    GLES20.GL_SRC_ALPHA, GLES20.GL_ONE_MINUS_SRC_ALPHA,
+    GLES20.GL_ONE, GLES20.GL_ONE_MINUS_SRC_ALPHA
+)
+```
+
+此例 alpha 为 `srcA + dstA × (1-srcA)`，避免普通 BlendFunc 的 SRC_ALPHA 同时作用于 alpha，使源 alpha 再平方。最终不透明视频可简化，但离屏透明合成需准确区分。
+
+#### 21.7.8 glBlendEquation：决定系数乘积怎样组合
+
+```java
+void GLES20.glBlendEquation(int mode);
+```
+
+mode 为 `GL_FUNC_ADD`、`GL_FUNC_SUBTRACT` 或 `GL_FUNC_REVERSE_SUBTRACT` 等当前版本/扩展支持的模式；本文使用默认 `GL_FUNC_ADD`。
+
+```kotlin
+GLES20.glBlendEquation(GLES20.GL_FUNC_ADD)
+```
+
+它指定相加/相减关系，BlendFunc 指定两边系数，Enable 指定是否执行混合，三者分工不同。与外部 renderer 混用时显式恢复方程，避免上一步减法混合影响水印。
+
+### 21.8 FBO 与 GPU 像素读回
+
+#### 21.8.1 glGenFramebuffers：生成 FBO 名称
+
+```java
+void GLES20.glGenFramebuffers(int n, int[] framebuffers, int offset);
+```
+
+n 为生成数量，framebuffers 为输出名称数组，offset 为起始元素位置。无返回值，与 GenTextures 的数组规则一致。
+
+```kotlin
+val names = IntArray(1)
+GLES20.glGenFramebuffers(1, names, 0)
+```
+
+只生成名称，不创建颜色像素存储；需要另外的二维纹理或 renderbuffer 附件。
+
+#### 21.8.2 glBindFramebuffer：选择后续绘制与读取目标
+
+```java
+void GLES20.glBindFramebuffer(int target, int framebuffer);
+```
+
+target 在 GLES20 中使用 `GL_FRAMEBUFFER`，framebuffer 为 FBO 名称；0 表示当前 EGLSurface 对应的默认 framebuffer。
+
+```kotlin
+GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, intermediateFbo)
+GLES20.glViewport(0, 0, intermediateWidth, intermediateHeight)
+// 绘制离屏 pass。
+GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+GLES20.glViewport(0, 0, outputWidth, outputHeight)
+```
+
+不能把 textureId 当成 FBO 名称。切换 EGLSurface 后，如果仍绑定命名 FBO，draw 依然写 FBO，所以最后输出必须显式恢复 0。
+
+#### 21.8.3 glFramebufferTexture2D：把二维纹理作为颜色附件
+
+```java
+void GLES20.glFramebufferTexture2D(
+        int target, int attachment, int textarget,
+        int texture, int level);
+```
+
+| 参数 | 含义 |
+|---|---|
+| `target` | `GL_FRAMEBUFFER`，修改当前绑定的命名 FBO |
+| `attachment` | 附件位置，本文 `GL_COLOR_ATTACHMENT0` |
+| `textarget` | 附加纹理的类型，本文 `GL_TEXTURE_2D` |
+| `texture` | 已创建且已分配存储的二维纹理名称；0 表示解除此附件 |
+| `level` | 使用的纹理层级，本文 ES 2.0 路径为 0 |
+
+```kotlin
+GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, fboId)
+GLES20.glFramebufferTexture2D(
+    GLES20.GL_FRAMEBUFFER, GLES20.GL_COLOR_ATTACHMENT0,
+    GLES20.GL_TEXTURE_2D, colorTextureId, 0
+)
+```
+
+它连接已有存储，不分配像素、不复制图像，也不执行 draw。不能将相机 OES 纹理直接作为本文颜色附件；不能同一 draw 又采样 colorTextureId 又向其写入。
+
+#### 21.8.4 glCheckFramebufferStatus：检查 FBO 是否可以绘制
+
+```java
+int GLES20.glCheckFramebufferStatus(int target);
+```
+
+target 为 `GL_FRAMEBUFFER`，查询当前绑定 FBO。返回 `GL_FRAMEBUFFER_COMPLETE` 才表示完整；其他返回值为诊断状态，不能只判断非零。
+
+| 常见状态 | 含义 |
+|---|---|
+| `GL_FRAMEBUFFER_COMPLETE` | 附件组合可用于绘制 |
+| `GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT` | 某个附件不满足要求，如无有效存储 |
+| `GL_FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT` | 没有附件 |
+| `GL_FRAMEBUFFER_INCOMPLETE_DIMENSIONS` | GLES2 中附件尺寸不兼容 |
+| `GL_FRAMEBUFFER_UNSUPPORTED` | 驱动不支持此附件格式组合 |
+
+```kotlin
+check(GLES20.glCheckFramebufferStatus(GLES20.GL_FRAMEBUFFER) == GLES20.GL_FRAMEBUFFER_COMPLETE)
+```
+
+在创建或更换附件后检查，不必稳定配置下每帧重复查询。RGBA8 普通纹理是常见起点，浮点/HDR 附件必须查询 renderable 能力。
+
+#### 21.8.5 glDeleteFramebuffers：删除 FBO 对象
+
+```java
+void GLES20.glDeleteFramebuffers(int n, int[] framebuffers, int offset);
+```
+
+n 为数量，framebuffers 为输入名称数组，offset 为起始元素位置，无返回值。
+
+```kotlin
+GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+GLES20.glDeleteFramebuffers(1, intArrayOf(fboId), 0)
+GLES20.glDeleteTextures(1, intArrayOf(colorTextureId), 0)
+```
+
+删除 FBO 不等于删除它连接的纹理，二者分别管理。分辨率改变时停止使用旧目标，再更新附件存储或重建目标。
+
+#### 21.8.6 glReadPixels：从当前 framebuffer 读像素到 CPU
+
+```java
+void GLES20.glReadPixels(
+        int x, int y, int width, int height,
+        int format, int type, Buffer pixels);
+```
+
+| 参数 | 含义 |
+|---|---|
+| `x` / `y` | 读取矩形左下角，在当前 framebuffer 中的像素坐标 |
+| `width` / `height` | 读取区域宽高，单位像素 |
+| `format` | 输出像素通道格式；本文 `GL_RGBA` |
+| `type` | 输出数据类型；本文 `GL_UNSIGNED_BYTE` 为每通道一个字节 |
+| `pixels` | **输出 Buffer**，从当前 position 写入，需有足够原生存储，考虑 PACK_ALIGNMENT |
+
+```kotlin
+val byteCountLong = width.toLong() * height * 4
+require(width > 0 && height > 0 && byteCountLong <= Int.MAX_VALUE)
+val byteCount = byteCountLong.toInt()
+val pixels = ByteBuffer.allocateDirect(byteCount).order(ByteOrder.nativeOrder())
+GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, snapshotFbo)
+GLES20.glPixelStorei(GLES20.GL_PACK_ALIGNMENT, 1)
+pixels.position(0)
+GLES20.glReadPixels(
+    0, 0, width, height,
+    GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, pixels
+)
+pixels.position(0)
+```
+
+需要先画好 snapshotFbo，函数不自动采样某个 textureId。第一行对应 GL 底部，保存常见图片时需要按转换方案调整行序；RGBA 字节也不能盲目当成 Java ARGB int。
+
+RGBA/UNSIGNED_BYTE 是本例归一化颜色缓冲的基础读回组合；其他格式/type 组合需按版本和能力查询。读取范围应处于有效缓冲中。这个调用可能同步等待 GPU，建议只在明确请求快照时执行。
+
+### 21.9 VBO：可选的顶点数据扩展
+
+正文使用 direct FloatBuffer 已能正确绘制。顶点数据多、重复使用或需要索引网格时，可把数据上传到 GPU buffer。本小节不是运行灰度示例的必需步骤。
+
+#### 21.9.1 glGenBuffers：生成缓冲对象名称
+
+```java
+void GLES20.glGenBuffers(int n, int[] buffers, int offset);
+```
+
+n 为生成数量，buffers 为输出数组，offset 为写入起点，无返回值。生成名称后还需 bind 和 BufferData 才有数据存储。
+
+```kotlin
+val names = IntArray(1)
+GLES20.glGenBuffers(1, names, 0)
+val vboId = names[0]
+```
+
+#### 21.9.2 glBindBuffer：选择后续缓冲操作的对象
+
+```java
+void GLES20.glBindBuffer(int target, int buffer);
+```
+
+target 为 `GL_ARRAY_BUFFER`（顶点数据）或 `GL_ELEMENT_ARRAY_BUFFER`（索引数据），buffer 为对应对象名称，0 表示解除该绑定。无返回值。
+
+```kotlin
+GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, vboId)
+```
+
+它决定 BufferData 修改哪个对象，也决定 VertexAttribPointer 的整数 offset 路径如何解释。不要把 Framebuffer 的 target 混进这里。
+
+#### 21.9.3 glBufferData：分配并上传缓冲存储
+
+```java
+void GLES20.glBufferData(int target, int size, Buffer data, int usage);
+```
+
+| 参数 | 含义 |
+|---|---|
+| `target` | 已 bind 的缓冲类别，ARRAY_BUFFER 或 ELEMENT_ARRAY_BUFFER |
+| `size` | 分配/上传大小，单位字节，不能写成 float 个数 |
+| `data` | 输入原生 Buffer，从 position 读取；null 可只分配存储 |
+| `usage` | 使用提示，常见 STATIC_DRAW（很少更新）、DYNAMIC_DRAW（重复更新）、STREAM_DRAW（短期使用） |
+
+```kotlin
+vertexBuffer.position(0)
+GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, vboId)
+GLES20.glBufferData(
+    GLES20.GL_ARRAY_BUFFER, vertexCount * componentsPerVertex * 4,
+    vertexBuffer, GLES20.GL_STATIC_DRAW
+)
+```
+
+usage 是驱动优化提示，不会限制之后一定不能修改。该调用创建或替换数据存储，上传后 GPU buffer 独立保存数据；pointer 的 stride/offset 必须对应你真实上传布局。
+
+#### 21.9.4 glDeleteBuffers：回收 VBO / 索引缓冲
+
+```java
+void GLES20.glDeleteBuffers(int n, int[] buffers, int offset);
+```
+
+n 为删除数量，buffers 为输入对象名称数组，offset 为读取起点，无返回值。停止 draw 使用后删除，并更新应用保存的名称/属性布局，避免后续继续沿用旧资源。
+
+```kotlin
+GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, 0)
+GLES20.glDeleteBuffers(1, intArrayOf(vboId), 0)
+```
+
+它不释放 Java direct Buffer，不删除纹理，也不负责退出 GL 线程。
+
+### 21.10 命令提交和等待
+
+#### 21.10.1 glFlush：让已排队命令开始推进
+
+```java
+void GLES20.glFlush();
+```
+
+无参数、无返回值。促使之前的 GL 命令向执行阶段推进，但不等待所有工作完成，也不提交 Android Surface 的显示帧。
+
+正常窗口渲染在 swap 时已经有相应提交行为，通常无需再每帧加 glFlush。跨上下文协作要使用明确同步方案，单纯 flush 不能证明另一个上下文已安全读到完整结果。
+
+#### 21.10.2 glFinish：等待此前 GL 工作完成
+
+```java
+void GLES20.glFinish();
+```
+
+无参数、无返回值。调用线程等待此前 GL 命令的效果完成，可能显著停顿。它不代表编码器、播放器等下游已经消费完成，也不是输入 Surface 可以释放的 CameraX 信号。
+
+同一上下文连续 pass 顺序由 GL 命令顺序保证；每 pass 调用 glFinish 通常没有必要。glReadPixels 的客户端读回已经需要使返回数据可供 CPU 使用，也不应无条件再加一次 finish。性能诊断或跨 API 同步需求应单独设计。
+
+### 21.11 SurfaceTexture：相机帧如何进入 OES 纹理
+
+下面是 Android 图形 API，不是 GLES20 函数；但它负责连接 CameraX 输入与纹理采样，必须与 GL 部分一起理解。
+
+#### 21.11.1 SurfaceTexture 构造函数
+
+```java
+SurfaceTexture(int texName);
+SurfaceTexture(int texName, boolean singleBufferMode);
+```
+
+| 参数 | 含义 |
+|---|---|
+| `texName` | 与 SurfaceTexture 关联的 GL 外部纹理名称；本文先生成并配置 OES 纹理再传入 |
+| `singleBufferMode` | 是否采用单缓冲模式；本文使用单参数构造函数的普通模式，不引入单缓冲所有权交接 |
+
+```kotlin
+val surfaceTexture = SurfaceTexture(textureId)
+val inputSurface = Surface(surfaceTexture)
+```
+
+创建后它是队列消费者，`Surface(surfaceTexture)` 是生产者使用的 Surface 包装。singleBufferMode=true 需要配套 releaseTexImage 等严格的交接协议，不应为了“更省内存”直接开启到相机示例。
+
+平台另有不立即附加纹理的构造路径，用于之后显式 attach 到 GLContext；本文已附加构造路径不需要再 attach，同一个 SurfaceTexture 的上下文转移也不能只切换线程变量。
+
+#### 21.11.2 setDefaultBufferSize：指定输入缓冲期望尺寸
+
+```java
+void SurfaceTexture.setDefaultBufferSize(int width, int height);
+```
+
+width/height 为缓冲区像素宽高，使用 `SurfaceRequest.resolution`，没有返回值。它不是 viewport，也不是 shader UV 范围。
+
+```kotlin
+surfaceTexture.setDefaultBufferSize(request.resolution.width, request.resolution.height)
+```
+
+在 provideSurface 前设置。生产者可能有自己的尺寸协商，本例按 CameraX 明确请求设置；随意改成屏幕尺寸会使 Surface 不符合请求或产生错误比例。
+
+#### 21.11.3 setOnFrameAvailableListener：注册可消费帧通知
+
+```java
+void SurfaceTexture.setOnFrameAvailableListener(OnFrameAvailableListener listener);
+void SurfaceTexture.setOnFrameAvailableListener(
+        OnFrameAvailableListener listener, Handler handler);
+```
+
+| 参数 | 含义 |
+|---|---|
+| `listener` | 新帧可用的回调；null 表示移除监听。回调参数是触发通知的 SurfaceTexture |
+| `handler` | 调度回调的 Handler，本文 glHandler 保证线程确定；无 Handler 版本使用平台规定的调度方式 |
+
+```kotlin
+surfaceTexture.setOnFrameAvailableListener({ source ->
+    renderer.makePbufferCurrent()
+    source.updateTexImage()
+    // 继续读取矩阵、时间戳和绘制。
+}, glHandler)
+```
+
+回调参数不是 Bitmap，也不是 pixel Buffer；通知不会自动调用 updateTexImage。注册 GL Handler 仍不等于上下文已 current，所以代码继续显式绑定 EGL 目标。
+
+移除监听不保证此前已经排入队列的任务都消失，因此还要检查输入资源是否有效、是否 closing。完整版中的资源集合判断就是为此服务。
+
+#### 21.11.4 updateTexImage：取得最新可用图像
+
+```java
+void SurfaceTexture.updateTexImage();
+```
+
+无参数、无返回值。将消费者选取的最新图像更新到关联的 OES 纹理，并更新这张图像的矩阵与时间戳信息，可能跳过较旧图像。
+
+必须在关联 GL 上下文 current 的线程调用；对象已释放、上下文不对等情况可能抛出异常。它不执行你自己的滤镜 shader，也不把图像交给输出 Surface。
+
+此方法可能改变外部纹理绑定状态。后续 draw 仍显式设置 active texture 和 bind 输入纹理，不依赖调用前残留的绑定。
+
+#### 21.11.5 getTransformMatrix：取得当前图像采样映射
+
+```java
+void SurfaceTexture.getTransformMatrix(float[] mtx);
+```
+
+mtx 为**输出数组**，长度必须**恰好等于 16**，平台会检查长度，写入列主序 4×4 变换。它描述从基础齐次 UV `(s,t,0,1)` 到实际图像采样坐标的映射，包含底层图像所需的变换。
+
+```kotlin
+surfaceTexture.updateTexImage()
+surfaceTexture.getTransformMatrix(inputMatrix)
+surfaceOutput.updateTransformMatrix(outputMatrix, inputMatrix)
+```
+
+在 update 后取得对应图像的矩阵。数组不是 program 的 uniform 本身，还需上传组合矩阵。它也不等于 CameraX ViewPort 的全部裁剪/旋转信息，因此随后调用 SurfaceOutput.updateTransformMatrix。
+
+#### 21.11.6 getTimestamp：取得当前图像时间戳
+
+```java
+long SurfaceTexture.getTimestamp();
+```
+
+无参数，返回当前 update 取得图像的生产时间戳，单位纳秒；Kotlin 用 `surfaceTexture.timestamp`。没有取得有效图像前，不要把初始值当正常帧时间。
+
+```kotlin
+surfaceTexture.updateTexImage()
+val timestampNs = surfaceTexture.timestamp
+```
+
+时间基准由图像来源决定，不能当 UTC 时间显示，也不能未经转换与另一来源时间戳相减。单路相机录像应保留该流时间顺序，重复通知取得同一 timestamp 时避免重复提交。
+
+#### 21.11.7 SurfaceTexture.release 与 Surface.release
+
+```java
+void SurfaceTexture.release();
+void Surface.release();
+```
+
+二者都无参数、无返回值，但释放不同对象。SurfaceTexture.release 释放其消费者资源并使队列进入不可继续使用的状态；Surface.release 释放当前 Android Surface 包装所持原生引用。
+
+```kotlin
+// 仅在对应 provideSurface 结果回调后回收自己创建的输入。
+surfaceTexture.setOnFrameAvailableListener(null)
+inputSurface.release()
+surfaceTexture.release()
+GLES20.glDeleteTextures(1, intArrayOf(textureId), 0)
+```
+
+SurfaceTexture.release 不代替显式纹理名称管理，Surface.release 也不代替 EGLSurface 销毁。输出 getSurface 返回的 Android Surface 不归处理器所有，不能套用输入释放代码。
+
+### 21.12 android.opengl.Matrix：自定义 4×4 变换
+
+这些方法是 CPU 数组运算，无须 current EGLContext；但若矩阵由 GL 线程使用，跨线程更新仍需要避免同时读写。都使用列主序 4×4 数组，offset 为 float 元素位置。
+
+#### 21.12.1 setIdentityM：写入单位矩阵
+
+```java
+void Matrix.setIdentityM(float[] sm, int smOffset);
+```
+
+sm 为输出数组，smOffset 为起始元素索引，从此位置起至少 16 个 float。没有返回值。单位矩阵对角为 1，其余为 0，乘任何坐标不改变它。
+
+```kotlin
+android.opengl.Matrix.setIdentityM(customMatrix, 0)
+```
+
+新建 FloatArray(16) 得到全 0，不是单位矩阵；全零矩阵会让 UV 全部变成同一个位置。
+
+#### 21.12.2 translateM：右乘平移变换
+
+```java
+void Matrix.translateM(float[] m, int mOffset, float x, float y, float z);
+void Matrix.translateM(
+        float[] tm, int tmOffset, float[] m, int mOffset,
+        float x, float y, float z);
+```
+
+| 参数 | 含义 |
+|---|---|
+| `m` / `mOffset` | 原矩阵及起始位置；单数组版本原地修改 |
+| `tm` / `tmOffset` | 双数组版本的输出矩阵及起始位置 |
+| `x` / `y` / `z` | 三轴平移量，单位取决于坐标空间：UV 中 0.5 是半个归一化范围，不是半个像素 |
+
+结果为 `M × T`，按列向量规则，对坐标先应用 T 再应用 M。
+
+```kotlin
+android.opengl.Matrix.translateM(customMatrix, 0, 0.5f, 0.5f, 0f)
+```
+
+连续调用的代码顺序不等于向量最终经历变换的顺序，需要按矩阵乘法检查。围绕 UV 中心缩放的前后平移可参照第 11.6 节。
+
+#### 21.12.3 scaleM：右乘缩放变换
+
+```java
+void Matrix.scaleM(float[] m, int mOffset, float x, float y, float z);
+void Matrix.scaleM(
+        float[] sm, int smOffset, float[] m, int mOffset,
+        float x, float y, float z);
+```
+
+m/mOffset 为输入矩阵；单数组版原地修改；sm/smOffset 为双数组版的输出。x/y/z 为各轴缩放倍数：1 保持，0.5 减半，负值包含轴翻转。结果为 `M × S`。
+
+```kotlin
+android.opengl.Matrix.scaleM(customMatrix, 0, 0.5f, 0.5f, 1f)
+```
+
+缩小“采样 UV”表示从更小区域取样，内容看起来变大；缩小“顶点几何”则使输出矩形变小。相同函数用于不同空间会得到不同视觉结果。
+
+#### 21.12.4 multiplyMM：计算两个矩阵的乘积
+
+```java
+void Matrix.multiplyMM(
+        float[] result, int resultOffset,
+        float[] lhs, int lhsOffset,
+        float[] rhs, int rhsOffset);
+```
+
+| 参数 | 含义 |
+|---|---|
+| `result` / `resultOffset` | 输出乘积矩阵的数组与起始位置 |
+| `lhs` / `lhsOffset` | 左乘矩阵及起始位置 |
+| `rhs` / `rhsOffset` | 右乘矩阵及起始位置 |
+
+结果为 lhs×rhs，不是逐元素相乘。对列向量来说先应用 rhs，再应用 lhs。每个数组从相应位置起需要 16 个 float。
+
+```kotlin
+android.opengl.Matrix.multiplyMM(finalMatrix, 0, outputMatrix, 0, customMatrix, 0)
+```
+
+为便于推导并避免不同实现下覆盖输入的细节，示例使用独立 result 数组。不要把顺序交换后期望同样效果；旋转、平移、裁剪通常不满足交换律。
+
+### 21.13 GLSL 中的构造、采样和颜色函数
+
+下面是在 GPU shader 里调用的 GLSL ES 1.00 函数或表达式，不是 Android Java API。它们不存在 Java 数组 offset，也不应在 Kotlin 中调用 `texture2D()`。
+
+#### 21.13.1 vec2 / vec3 / vec4：构造向量
+
+```glsl
+vec2 uv = vec2(0.5, 0.5);
+vec3 grayRgb = vec3(gray);
+vec4 homogeneousUv = vec4(uv, 0.0, 1.0);
+vec4 outputColor = vec4(grayRgb, alpha);
+```
+
+| 构造 | 各参数含义 |
+|---|---|
+| `vec2(x,y)` | 两个分量依次为 x、y |
+| `vec3(value)` | 一个标量扩展为三个相同分量，适合灰度 RGB |
+| `vec4(uv,z,w)` | uv 提供前两分量，z 和 w 依次补充；纹理齐次坐标用 z=0、w=1 |
+| `vec4(rgb,alpha)` | rgb 三个通道加 alpha，得到四通道颜色 |
+
+`.xy`、`.rgb`、`.a` 是分量选择语法，称 swizzle/分量访问，不是另外一次矩阵运算。mat4×vec4 表示矩阵作用于列向量。
+
+#### 21.13.2 texture2D：按归一化坐标采样纹理
+
+```glsl
+vec4 texture2D(sampler2D sampler, vec2 coord);
+// OES 扩展额外提供对 samplerExternalOES 的采样支持。
+vec4 texture2D(samplerExternalOES sampler, vec2 coord);
+```
+
+sampler 是已通过 uniform 指向纹理单元的采样器，coord 是归一化 UV，返回采样 RGBA vec4。过滤和边界行为由绑定纹理的参数决定。
+
+```glsl
+vec4 source = texture2D(uTexture, vTexCoord);
+```
+
+它不接受 textureId，也不读取 Android View 像素。OES sampler 必须声明对应扩展；采样返回值已经是纹理可见颜色表示，不能把它直接当相机 YUV 原始平面。
+
+普通 sampler2D 还有使用偏差参数的版本，但 OES 的纹理/LOD 限制不同；本文只使用共同的两参数路径，不把 mipmap bias 任意套到外部相机纹理。
+
+#### 21.13.3 dot：计算两个向量的点积
+
+```glsl
+float dot(vec3 x, vec3 y);
+```
+
+x/y 必须有相同维度，返回各分量乘积的和。支持相应浮点向量维度，不只 vec3。
+
+```glsl
+float gray = dot(source.rgb, vec3(0.299, 0.587, 0.114));
+```
+
+这句等于 R×0.299 + G×0.587 + B×0.114。dot 不自动转换色彩空间，权重应匹配你的颜色/亮度定义。
+
+#### 21.13.4 mix：按权重插值
+
+```glsl
+vec3 mix(vec3 x, vec3 y, float a);
+```
+
+x 为起点，y 为终点，a 为插值权重；返回 `x×(1-a) + y×a`。a=0 为 x，a=1 为 y，中间连续混合。也支持同型向量权重等合法重载。
+
+```glsl
+vec3 filtered = mix(source.rgb, vec3(gray), uIntensity);
+```
+
+mix 不自动把 a 限制到 0～1，超出会外推；本文 UI/Processor 将强度约束。饱和度算法可能故意使用大于 1 的权重，随后处理颜色范围。
+
+#### 21.13.5 clamp：将数值限制在范围内
+
+```glsl
+vec3 clamp(vec3 x, float minVal, float maxVal);
+float clamp(float x, float minVal, float maxVal);
+```
+
+x 为待限制数据，minVal/maxVal 为下限/上限；返回逐分量 `min(max(x,minVal),maxVal)`。
+
+```glsl
+vec3 safeRgb = clamp(adjustedRgb, 0.0, 1.0);
+```
+
+下限应不大于上限。clamp 是范围裁切，不能替代 HDR 到 SDR 的正确 tone mapping，也不进行 gamma 转换。
+
+#### 21.13.6 floor 与 fract：LUT 切片位置及插值权重
+
+```glsl
+float floor(float x);
+float fract(float x);
+```
+
+两个函数的唯一参数 x 为输入数值。floor 返回不大于 x 的最大整数的浮点表示；fract 返回 `x-floor(x)`，用于小数部分，也支持逐分量向量重载。
+
+```glsl
+float slice = blue * (lutSize - 1.0);
+float lower = floor(slice);
+float weight = fract(slice);
+```
+
+这里 floor 的返回仍是浮点，不能当任意动态数组索引使用而不考虑 GLSL ES 1.00 限制。负数的 fract 与一些语言的取余行为不同，LUT 输入先约束在有效颜色范围。
+
+#### 21.13.7 min / max 与 mod：限制上切片并定位 atlas
+
+```glsl
+float min(float x, float y);
+float max(float x, float y);
+float mod(float x, float y);
+```
+
+min/max 返回两输入较小/较大值，也支持合法向量重载。mod(x,y) 返回 `x-y*floor(x/y)`，不是 GLSL 浮点 `%` 运算，y 不应为 0。
+
+```glsl
+float upper = min(lower + 1.0, lutSize - 1.0);
+float tileX = mod(lower, tilesPerRow);
+float tileY = floor(lower / tilesPerRow);
+```
+
+atlas 维度、tile 数和 LUT 文件的排列规则必须对应。min 限制最高切片，mod/floor 决定列行，随后加半 texel 偏移再除以 atlas 像素尺寸取得 UV。
+
+#### 21.13.8 gl_Position 与 gl_FragColor：阶段的输出变量
+
+```glsl
+gl_Position = aPosition;
+gl_FragColor = vec4(filteredRgb, alpha);
+```
+
+它们不是函数，没有参数列表。GLSL ES 1.00 的 gl_Position 是 vertex shader 输出的齐次裁剪坐标，经过 w 除法和 viewport 变换；gl_FragColor 是 fragment shader 输出的 RGBA，之后仍受混合、写入等状态影响。
+
+将颜色赋给 gl_FragColor 不自动提交 Android Surface。shader 执行依赖 draw，最终窗口帧提交依赖 EGL swap。迁移 GLSL ES 3.x 时，片元输出需要采用该版本的显式 out 变量用法。
+
+### 21.14 将 API 放回一帧的完整调用顺序
+
+| 阶段 | 关键调用 | 此时数据或状态的变化 |
+|---|---|---|
+| 一次性 EGL 初始化 | getDisplay → initialize → chooseConfig → createContext → createPbuffer → makeCurrent | GL 线程有可用 context 和目标 |
+| 一次性程序初始化 | createShader → shaderSource → compile/status/log → createProgram → attach → link/status/log → getLocation | 可以执行的 GPU 程序与变量位置已准备 |
+| 输入请求 | genTexture → bind OES → texParameteri → SurfaceTexture → defaultBufferSize → provideSurface | 相机有可写的输入队列 |
+| 输出接入 | getSurface → createWindowSurface | 存在可提交给下游的 EGL 目标 |
+| 帧取得 | makePbufferCurrent → updateTexImage → getTransformMatrix/getTimestamp | OES 纹理与元信息对应最新取得帧 |
+| 输出映射 | SurfaceOutput.updateTransformMatrix | 获取当前输出需要的采样映射 |
+| 绘制准备 | makeCurrent → bindFramebuffer → viewport → clear/state → useProgram | 当前 target 与 GL 状态确定 |
+| 输入和参数 | enableAttrib/pointer → uniformMatrix/intensity → activeTexture/bind → sampler uniform | 顶点、采样器、矩阵和算法参数配套 |
+| 处理提交 | drawArrays → presentationTime → swapBuffers | GPU 滤镜结果进入下游队列 |
+| 输出收尾 | 切回 Pbuffer → destroy EGLSurface → SurfaceOutput.close | 停止写这个下游 |
+| 输入归还 | 移除监听 → release Surface/SurfaceTexture → deleteTexture | 相机不再使用的输入资源回收 |
+| 最终退出 | deleteProgram/中间资源 → 解除 current → destroySurface/context → terminate → releaseThread | 保证所有输入归还后退出 GL 环境 |
+
+想扩展功能时，先判断它改变哪一类状态：只调颜色新增 uniform；读取邻域引入额外采样或 FBO；叠加图片新增二维纹理和 draw；改变区域新增矩阵；保存图像新增受控读回。这样能确定应该修改哪一段，而不是把新 API 随意塞进帧循环。
