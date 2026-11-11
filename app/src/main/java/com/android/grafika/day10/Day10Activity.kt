@@ -2,9 +2,11 @@ package com.android.grafika.day10
 
 import android.Manifest
 import android.content.pm.PackageManager
+import android.content.res.Configuration
 import android.graphics.SurfaceTexture
 import android.opengl.GLSurfaceView
 import android.os.Bundle
+import android.util.Log
 import android.view.Surface
 import android.widget.Button
 import androidx.appcompat.app.AppCompatActivity
@@ -37,6 +39,11 @@ class Day10Activity : AppCompatActivity() {
     private lateinit var btnSwitchCamera: Button
     private var lensFacing = CameraSelector.LENS_FACING_BACK
     private val cameraExecutor = Executors.newSingleThreadExecutor()
+    private var previewUseCase: Preview? = null
+    private fun currentDisplayRotation(): Int {
+        return binding.glSurfaceView.display?.rotation
+            ?: Surface.ROTATION_0
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -74,9 +81,17 @@ class Day10Activity : AppCompatActivity() {
         cameraProviderFuture.addListener({
             try {
                 val cameraProvider = cameraProviderFuture.get()
-                val preview = Preview.Builder().build()
-                preview.setSurfaceProvider {request ->
+                val preview = Preview.Builder().setTargetRotation(currentDisplayRotation())
+                    .build()
+                previewUseCase = preview
+                preview.setSurfaceProvider { request ->
                     val resolution = request.resolution
+                    Log.d(TAG, "SurfaceProvider: ${resolution.width}, ${resolution.height}")
+                    renderer.setInputSize(resolution.width, resolution.height)
+                    request.setTransformationInfoListener(ContextCompat.getMainExecutor(this)) {
+                        Log.d(TAG, "TransformationInfoListener: ${it.rotationDegrees}")
+                        renderer.setInputRotation(it.rotationDegrees)
+                    }
                     surfaceTexture.setDefaultBufferSize(resolution.width, resolution.height)
                     val surface = Surface(surfaceTexture)
                     request.provideSurface(
@@ -89,7 +104,8 @@ class Day10Activity : AppCompatActivity() {
                 val cameraSelector = CameraSelector.Builder()
                     .requireLensFacing(lensFacing)
                     .build()
-                val cameraType = if (lensFacing == CameraSelector.LENS_FACING_BACK) "后置" else "前置"
+                val cameraType =
+                    if (lensFacing == CameraSelector.LENS_FACING_BACK) "后置" else "前置"
                 cameraProvider.unbindAll()
 
                 cameraProvider.bindToLifecycle(this, cameraSelector, preview)
@@ -157,5 +173,10 @@ class Day10Activity : AppCompatActivity() {
         super.onDestroy()
         cameraExecutor.shutdown()
         renderer.release()
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        previewUseCase?.targetRotation = currentDisplayRotation()
     }
 }

@@ -4,6 +4,7 @@ import android.graphics.SurfaceTexture
 import android.opengl.GLES11Ext
 import android.opengl.GLES20
 import android.opengl.GLSurfaceView
+import android.util.Log
 import com.android.grafika.gles.GlUtil
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -28,6 +29,14 @@ class Day10Renderer(private val glSurfaceView: GLSurfaceView) : GLSurfaceView.Re
     private var aPositionLoc: Int = 0
     private var aTexCoordLoc: Int = 0
 
+    @Volatile
+    private var inputWidth = 1
+    @Volatile
+    private var inputHeight = 1
+    private var outputWidth = 1
+    private var outputHeight = 1
+    private var sourceRotation: Int = 0
+
     private val vertexShaderCode = """
         attribute vec4 aPosition;
         attribute vec4 aTexCoord;
@@ -35,9 +44,8 @@ class Day10Renderer(private val glSurfaceView: GLSurfaceView) : GLSurfaceView.Re
         varying vec2 vTexCoord;
         
         void main() {
-            vec4 transformedCoord = uTransformMatrix * aTexCoord;
-            vTexCoord = transformedCoord.xy;
             gl_Position = aPosition;
+            vTexCoord =(uTransformMatrix * aTexCoord).xy;
         }
     """.trimIndent()
 
@@ -79,7 +87,6 @@ class Day10Renderer(private val glSurfaceView: GLSurfaceView) : GLSurfaceView.Re
         uTransformMatrixLoc = GLES20.glGetUniformLocation(program, "uTransformMatrix")
         aPositionLoc = GLES20.glGetAttribLocation(program, "aPosition")
         aTexCoordLoc = GLES20.glGetAttribLocation(program, "aTexCoord")
-
         vertexBuffer = ByteBuffer.allocateDirect(quadVertices.size * 4)
             .order(ByteOrder.nativeOrder())
             .asFloatBuffer()
@@ -105,6 +112,9 @@ class Day10Renderer(private val glSurfaceView: GLSurfaceView) : GLSurfaceView.Re
         width: Int,
         height: Int
     ) {
+        outputHeight = height
+        outputWidth = width
+        Log.d("Day10Renderer", "onSurfaceChanged: $width, $height")
         GLES20.glViewport(0, 0, width, height)
     }
 
@@ -118,6 +128,14 @@ class Day10Renderer(private val glSurfaceView: GLSurfaceView) : GLSurfaceView.Re
         } catch (_: Exception) {
             return
         }
+        updateViewport(
+            viewWidth = outputWidth,
+            viewHeight = outputHeight,
+            sourceWidth = inputWidth,
+            sourceHeight = inputHeight,
+            rotationDegrees = sourceRotation,
+            fill = false
+        )
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
         GLES20.glUseProgram(program)
 
@@ -203,7 +221,64 @@ class Day10Renderer(private val glSurfaceView: GLSurfaceView) : GLSurfaceView.Re
         }
     }
 
-    private fun startCamera() {
-        TODO()
+    fun setInputSize(width: Int, height: Int) {
+        inputWidth = width
+        inputHeight = height
+    }
+
+    fun setInputRotation(rotation: Int) {
+        sourceRotation = rotation
+    }
+
+    private fun updateViewport(
+        viewWidth: Int,
+        viewHeight: Int,
+        sourceWidth: Int,
+        sourceHeight: Int,
+        rotationDegrees: Int,
+        fill: Boolean
+    ) {
+        var sourceW = sourceWidth
+        var sourceH = sourceHeight
+
+        if (rotationDegrees == 90 || rotationDegrees == 270) {
+            val temp = sourceW
+            sourceW = sourceHeight
+            sourceH = temp
+        }
+
+        val sourceAspect = sourceW.toFloat() / sourceH
+        val viewAspect = viewWidth.toFloat() / viewHeight
+
+        val viewportWidth: Int
+        val viewportHeight: Int
+
+        if (fill) {
+            if (sourceAspect > viewAspect) {
+                viewportWidth = (viewHeight * sourceAspect).toInt()
+                viewportHeight = viewHeight
+            } else {
+                viewportWidth = viewWidth
+                viewportHeight = (viewWidth / sourceAspect).toInt()
+            }
+        } else {
+            if (sourceAspect > viewAspect) {
+                viewportWidth = viewWidth
+                viewportHeight = (viewWidth / sourceAspect).toInt()
+            } else {
+                viewportWidth = (viewHeight * sourceAspect).toInt()
+                viewportHeight = viewHeight
+            }
+        }
+
+        val x = (viewWidth - viewportWidth) / 2
+        val y = (viewHeight - viewportHeight) / 2
+
+        GLES20.glViewport(
+            x,
+            y,
+            viewportWidth,
+            viewportHeight
+        )
     }
 }
