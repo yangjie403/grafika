@@ -4,8 +4,11 @@ import android.Manifest
 import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.graphics.SurfaceTexture
+import android.hardware.display.DisplayManager
 import android.opengl.GLSurfaceView
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import android.view.Surface
 import android.widget.Button
@@ -40,9 +43,29 @@ class Day10Activity : AppCompatActivity() {
     private var lensFacing = CameraSelector.LENS_FACING_BACK
     private val cameraExecutor = Executors.newSingleThreadExecutor()
     private var previewUseCase: Preview? = null
+    private lateinit var displayManager: DisplayManager
+    private val displayListener = object : DisplayManager.DisplayListener {
+        override fun onDisplayAdded(displayId: Int) = Unit
+
+        override fun onDisplayRemoved(displayId: Int) = Unit
+
+        override fun onDisplayChanged(displayId: Int) {
+            if (glSurfaceView.display?.displayId == displayId) {
+                updateTargetRotation()
+            }
+        }
+    }
+
     private fun currentDisplayRotation(): Int {
         return binding.glSurfaceView.display?.rotation
             ?: Surface.ROTATION_0
+    }
+
+    private fun updateTargetRotation() {
+        previewUseCase?.let { preview ->
+            val rotation = currentDisplayRotation()
+            if (preview.targetRotation != rotation) preview.targetRotation = rotation
+        }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -51,6 +74,7 @@ class Day10Activity : AppCompatActivity() {
         setContentView(binding.root)
 
         glSurfaceView = binding.glSurfaceView
+        displayManager = getSystemService(DisplayManager::class.java)
         glSurfaceView.setEGLContextClientVersion(2)
         renderer = Day10Renderer(glSurfaceView)
         glSurfaceView.setRenderer(renderer)
@@ -90,7 +114,11 @@ class Day10Activity : AppCompatActivity() {
                     renderer.setInputSize(resolution.width, resolution.height)
                     request.setTransformationInfoListener(ContextCompat.getMainExecutor(this)) {
                         Log.d(TAG, "TransformationInfoListener: ${it.rotationDegrees}")
-                        renderer.setInputRotation(it.rotationDegrees)
+                        renderer.setInputTransformation(
+                            rotationDegrees = it.rotationDegrees,
+                            hasCameraTransform = it.hasCameraTransform(),
+                            targetRotation = preview.targetRotation
+                        )
                     }
                     surfaceTexture.setDefaultBufferSize(resolution.width, resolution.height)
                     val surface = Surface(surfaceTexture)
@@ -162,9 +190,12 @@ class Day10Activity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         glSurfaceView.onResume()
+        displayManager.registerDisplayListener(displayListener, Handler(Looper.getMainLooper()))
+        updateTargetRotation()
     }
 
     override fun onPause() {
+        displayManager.unregisterDisplayListener(displayListener)
         glSurfaceView.onPause()
         super.onPause()
     }
@@ -177,6 +208,6 @@ class Day10Activity : AppCompatActivity() {
 
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
-        previewUseCase?.targetRotation = currentDisplayRotation()
+        glSurfaceView.post { updateTargetRotation() }
     }
 }

@@ -4,7 +4,9 @@ import android.graphics.SurfaceTexture
 import android.opengl.GLES11Ext
 import android.opengl.GLES20
 import android.opengl.GLSurfaceView
+import android.opengl.Matrix
 import android.util.Log
+import android.view.Surface
 import com.android.grafika.gles.GlUtil
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -21,6 +23,8 @@ class Day10Renderer(private val glSurfaceView: GLSurfaceView) : GLSurfaceView.Re
     private var uTextureLoc: Int = 0
     private var uTransformMatrixLoc: Int = 0
     private val transformMatrix = FloatArray(16)
+    private var uPositionMatrixLoc: Int = 0
+    private val positionMatrix = FloatArray(16).apply { Matrix.setIdentityM(this, 0) }
 
     @Volatile
     private var surfaceTextureReady = false
@@ -41,10 +45,11 @@ class Day10Renderer(private val glSurfaceView: GLSurfaceView) : GLSurfaceView.Re
         attribute vec4 aPosition;
         attribute vec4 aTexCoord;
         uniform mat4 uTransformMatrix;
+        uniform mat4 uPositionMatrix;
         varying vec2 vTexCoord;
         
         void main() {
-            gl_Position = aPosition;
+            gl_Position = uPositionMatrix * aPosition;
             vTexCoord =(uTransformMatrix * aTexCoord).xy;
         }
     """.trimIndent()
@@ -85,6 +90,7 @@ class Day10Renderer(private val glSurfaceView: GLSurfaceView) : GLSurfaceView.Re
         program = GlUtil.createProgram(vertexShaderCode, fragmentShaderCode)
         uTextureLoc = GLES20.glGetUniformLocation(program, "uTexture")
         uTransformMatrixLoc = GLES20.glGetUniformLocation(program, "uTransformMatrix")
+        uPositionMatrixLoc = GLES20.glGetUniformLocation(program, "uPositionMatrix")
         aPositionLoc = GLES20.glGetAttribLocation(program, "aPosition")
         aTexCoordLoc = GLES20.glGetAttribLocation(program, "aTexCoord")
         vertexBuffer = ByteBuffer.allocateDirect(quadVertices.size * 4)
@@ -134,7 +140,7 @@ class Day10Renderer(private val glSurfaceView: GLSurfaceView) : GLSurfaceView.Re
             sourceWidth = inputWidth,
             sourceHeight = inputHeight,
             rotationDegrees = sourceRotation,
-            fill = false
+            fill = true
         )
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
         GLES20.glUseProgram(program)
@@ -144,6 +150,7 @@ class Day10Renderer(private val glSurfaceView: GLSurfaceView) : GLSurfaceView.Re
         GLES20.glUniform1i(uTextureLoc, 0)
 
         GLES20.glUniformMatrix4fv(uTransformMatrixLoc, 1, false, transformMatrix, 0)
+        GLES20.glUniformMatrix4fv(uPositionMatrixLoc, 1, false, positionMatrix, 0)
 
         vertexBuffer.position(0)
         GLES20.glVertexAttribPointer(
@@ -222,12 +229,33 @@ class Day10Renderer(private val glSurfaceView: GLSurfaceView) : GLSurfaceView.Re
     }
 
     fun setInputSize(width: Int, height: Int) {
-        inputWidth = width
-        inputHeight = height
+        glSurfaceView.queueEvent {
+            inputWidth = width
+            inputHeight = height
+            glSurfaceView.requestRender()
+        }
     }
 
-    fun setInputRotation(rotation: Int) {
-        sourceRotation = rotation
+    fun setInputTransformation(
+        rotationDegrees: Int,
+        hasCameraTransform: Boolean,
+        targetRotation: Int
+    ) {
+        glSurfaceView.queueEvent {
+            // 完整旋转用于计算最终宽高比，不代表还需要把它全部叠加到图像上。
+            sourceRotation = rotationDegrees
+            val displayDegrees = when (targetRotation) {
+                Surface.ROTATION_90 -> 90
+                Surface.ROTATION_180 -> 180
+                Surface.ROTATION_270 -> 270
+                else -> 0
+            }
+            // 直连相机的纹理矩阵已包含传感器方向，只补目标显示方向。
+            // 无相机变换时才应用完整的顺时针旋转；GL 顶点坐标的正角为逆时针。
+            val vertexRotation = if (hasCameraTransform) displayDegrees else -rotationDegrees
+            Matrix.setRotateM(positionMatrix, 0, vertexRotation.toFloat(), 0f, 0f, 1f)
+        }
+        glSurfaceView.requestRender()
     }
 
     private fun updateViewport(
@@ -280,5 +308,6 @@ class Day10Renderer(private val glSurfaceView: GLSurfaceView) : GLSurfaceView.Re
             viewportWidth,
             viewportHeight
         )
+        Log.d("Day10Renderer", "updateViewport: $viewportWidth, $viewportHeight")
     }
 }
