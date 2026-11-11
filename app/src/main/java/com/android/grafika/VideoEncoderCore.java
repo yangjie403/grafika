@@ -20,10 +20,14 @@ import android.media.MediaCodec;
 import android.media.MediaCodecInfo;
 import android.media.MediaFormat;
 import android.media.MediaMuxer;
+import android.os.Build;
 import android.util.Log;
 import android.view.Surface;
 
+import androidx.annotation.RequiresApi;
+
 import java.io.File;
+import java.io.FileDescriptor;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 
@@ -78,12 +82,14 @@ public class VideoEncoderCore {
     private MediaMuxer mMuxer;
     // H.264 MediaCodec 编码器：输入为 Surface，输出为压缩后的 ByteBuffer。
     private MediaCodec mEncoder;
+    private boolean mEncoderStarted;
     // 复用的输出信息对象，保存每次 dequeueOutputBuffer() 返回的 offset、size、PTS 和 flags。
     private MediaCodec.BufferInfo mBufferInfo;
     // 视频轨道在 MediaMuxer 中的索引；收到实际输出格式前为 -1。
     private int mTrackIndex;
     // MediaMuxer 是否已经 addTrack() 并 start()。
     private boolean mMuxerStarted;
+    private boolean mHasEncodedFrames;
 
 
     /**
@@ -91,11 +97,11 @@ public class VideoEncoderCore {
      *
      * <p>初始化顺序如下：</p>
      * <ol>
+     *     <li>打开输出文件，创建 MediaMuxer，但暂不添加轨道或调用 {@code start()}；</li>
      *     <li>创建视频 {@link MediaFormat}，指定编码尺寸、码率、帧率和 I 帧间隔；</li>
      *     <li>设置 {@link MediaCodecInfo.CodecCapabilities#COLOR_FormatSurface}，声明输入来自 Surface；</li>
      *     <li>创建并配置 H.264 编码器；</li>
-     *     <li>从编码器取得输入 Surface，并启动编码器；</li>
-     *     <li>创建 MediaMuxer，但暂不添加轨道或调用 {@code start()}。</li>
+     *     <li>从编码器取得输入 Surface，并启动编码器。</li>
      * </ol>
      *
      * <p>不能在构造函数中立即启动 muxer，因为编码器真正的输出格式（尤其是 SPS/PPS 等
@@ -110,6 +116,39 @@ public class VideoEncoderCore {
      */
     public VideoEncoderCore(int width, int height, int bitRate, File outputFile)
             throws IOException {
+        this(width, height, bitRate, new MediaMuxer(outputFile.toString(),
+                MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4));
+    }
+
+    /** 使用 MediaStore 打开的文件描述符直接录制，调用者负责在封装器释放后关闭描述符。 */
+    @RequiresApi(Build.VERSION_CODES.O)
+    public VideoEncoderCore(int width, int height, int bitRate, FileDescriptor outputDescriptor)
+            throws IOException {
+        this(width, height, bitRate, new MediaMuxer(outputDescriptor,
+                MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4));
+    }
+
+    private VideoEncoderCore(int width, int height, int bitRate, MediaMuxer muxer)
+            throws IOException {
+        mMuxer = muxer;
+        try {
+            prepareEncoder(width, height, bitRate);
+        } catch (IOException | RuntimeException e) {
+            // 构造失败时调用者拿不到本对象，需要在这里释放已创建的资源。
+            try {
+                release();
+            } catch (RuntimeException cleanupError) {
+                e.addSuppressed(cleanupError);
+            } finally {
+                if (mInputSurface != null) {
+                    mInputSurface.release();
+                }
+            }
+            throw e;
+        }
+    }
+
+    private void prepareEncoder(int width, int height, int bitRate) throws IOException {
         // BufferInfo 会在每次取出编码输出时被复用，减少对象分配。
         mBufferInfo = new MediaCodec.BufferInfo();
 
@@ -136,13 +175,7 @@ public class VideoEncoderCore {
         mInputSurface = mEncoder.createInputSurface();
         // 启动后才能提交帧，也才能逐步取得编码器实际输出格式和编码数据。
         mEncoder.start();
-
-        // 创建 MP4 封装器。这里先创建对象，但不能马上 addTrack()/start()：
-        // 编码器返回的初始 format 还不包含最终的 codec-specific data。
-        // 等 drainEncoder() 收到 INFO_OUTPUT_FORMAT_CHANGED 后再启动 muxer。
-        // 本类不封装音频，只把 H.264 视频基本码流写成 MP4。
-        mMuxer = new MediaMuxer(outputFile.toString(),
-                MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);
+        mEncoderStarted = true;
 
         // -1 表示尚未把视频轨道添加到 muxer；false 表示 muxer 尚未 start。
         mTrackIndex = -1;
@@ -171,6 +204,11 @@ public class VideoEncoderCore {
         return mInputSurface;
     }
 
+    /** 是否已向 MP4 写入有效视频帧，用于避免将空录像发布到相册。 */
+    public boolean hasEncodedFrames() {
+        return mHasEncodedFrames;
+    }
+
     /**
      * 释放编码器和封装器资源。
      *
@@ -182,24 +220,40 @@ public class VideoEncoderCore {
      * </pre>
      *
      * <p>调用者必须先完成 EOS 排空再调用本方法，否则文件可能缺少尾部数据或无法正确
-     * 完成封装。此方法本身没有实现完全幂等的错误恢复逻辑，调用时应处于正确的生命周期状态。</p>
+     * 完成封装。即使停止过程失败，也会继续释放其他资源。</p>
      */
     public void release() {
         if (VERBOSE) Log.d(TAG, "releasing encoder objects");
-        if (mEncoder != null) {
-            // stop() 结束编码器运行状态，release() 释放 MediaCodec 的底层资源。
-            mEncoder.stop();
-            mEncoder.release();
-            mEncoder = null;
-        }
-        if (mMuxer != null) {
-            // TODO: stop() throws an exception if you haven't fed it any data.  Keep track
-            //       of frames submitted, and don't call stop() if we haven't written anything.
-            // muxer 只有在 start() 后且写入过有效样本时才适合 stop()；当前实现假设正常流程
-            // 已经写入数据，因此保留原有行为并记录这个边界条件。
-            mMuxer.stop();
-            mMuxer.release();
-            mMuxer = null;
+        try {
+            if (mEncoder != null) {
+                try {
+                    if (mEncoderStarted) {
+                        mEncoder.stop();
+                    }
+                } finally {
+                    try {
+                        mEncoder.release();
+                    } finally {
+                        mEncoder = null;
+                        mEncoderStarted = false;
+                    }
+                }
+            }
+        } finally {
+            if (mMuxer != null) {
+                try {
+                    if (mMuxerStarted) {
+                        mMuxer.stop();
+                    }
+                } finally {
+                    try {
+                        mMuxer.release();
+                    } finally {
+                        mMuxer = null;
+                        mMuxerStarted = false;
+                    }
+                }
+            }
         }
     }
 
@@ -313,6 +367,7 @@ public class VideoEncoderCore {
 
                     // 写入一个视频样本；BufferInfo 同时携带该样本的 PTS 和 flags。
                     mMuxer.writeSampleData(mTrackIndex, encodedData, mBufferInfo);
+                    mHasEncodedFrames = true;
                     if (VERBOSE) {
                         Log.d(TAG, "sent " + mBufferInfo.size + " bytes to muxer, ts=" +
                                 mBufferInfo.presentationTimeUs);

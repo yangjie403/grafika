@@ -4,7 +4,11 @@ import android.Manifest;
 import android.app.Activity;
 import android.content.pm.PackageManager;
 import android.hardware.camera2.CameraCharacteristics;
+import android.hardware.display.DisplayManager;
+import android.os.Build;
 import android.os.Bundle;
+import android.view.Display;
+import android.view.Surface;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 import android.widget.Button;
@@ -29,10 +33,14 @@ import com.android.grafika.R;
  * SurfaceTexture 被错误线程调用。MediaCodec 使用 Surface 输入模式，OpenGL 绘制完成后
  * 通过 eglSwapBuffers() 把同一帧提交给编码器。</p>
  */
-public class Day13Activity extends Activity implements SurfaceHolder.Callback {
+public class Day13Activity extends Activity
+        implements SurfaceHolder.Callback, DisplayManager.DisplayListener {
     private static final int REQUEST_CAMERA = 1301;
+    private static final int REQUEST_VIDEO_STORAGE = 1302;
 
     private SurfaceHolder mSurfaceHolder;
+    private SurfaceView mPreviewView;
+    private DisplayManager mDisplayManager;
     private Day13RenderThread mRenderThread;
     private Button mRecordButton;
     private TextView mStatusView;
@@ -44,13 +52,27 @@ public class Day13Activity extends Activity implements SurfaceHolder.Callback {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_day13);
 
-        SurfaceView preview = findViewById(R.id.activity13_preview);
-        mSurfaceHolder = preview.getHolder();
+        mPreviewView = findViewById(R.id.activity13_preview);
+        mSurfaceHolder = mPreviewView.getHolder();
         mSurfaceHolder.addCallback(this);
+        mDisplayManager = getSystemService(DisplayManager.class);
 
         mRecordButton = findViewById(R.id.activity13_record);
         mStatusView = findViewById(R.id.activity13_status);
         mRecordButton.setOnClickListener(v -> {
+            if (mRenderThread == null) {
+                showStatus("相机尚未准备好");
+                return;
+            }
+            // Android 10 起写入应用自己创建的 MediaStore 视频不需要存储权限。
+            if (!mRecording && Build.VERSION.SDK_INT <= Build.VERSION_CODES.P
+                    && ActivityCompat.checkSelfPermission(this,
+                    Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
+                ActivityCompat.requestPermissions(this,
+                        new String[]{Manifest.permission.WRITE_EXTERNAL_STORAGE},
+                        REQUEST_VIDEO_STORAGE);
+                return;
+            }
             mRecording = !mRecording;
             mRecordButton.setText(mRecording ? "停止录制" : "开始录制");
             if (mRenderThread != null) {
@@ -82,9 +104,12 @@ public class Day13Activity extends Activity implements SurfaceHolder.Callback {
             return;
         }
 
-        mRenderThread = new Day13RenderThread(this, mLensFacing);
+        mRenderThread = new Day13RenderThread(this, mLensFacing, currentDisplayRotation());
         mRenderThread.start();
         mRenderThread.waitUntilReady();
+        // 180° 旋转不一定重建 Activity，因此需要监听显示方向的变化。
+        mDisplayManager.registerDisplayListener(this, null);
+        mRenderThread.setDisplayRotation(currentDisplayRotation());
         if (mSurfaceHolder != null && mSurfaceHolder.getSurface().isValid()) {
             mRenderThread.surfaceAvailable(
                     mSurfaceHolder.getSurface(),
@@ -96,6 +121,7 @@ public class Day13Activity extends Activity implements SurfaceHolder.Callback {
 
     @Override
     protected void onPause() {
+        mDisplayManager.unregisterDisplayListener(this);
         if (mRenderThread != null) {
             mRenderThread.shutdown();
             try {
@@ -126,6 +152,7 @@ public class Day13Activity extends Activity implements SurfaceHolder.Callback {
             int height
     ) {
         if (mRenderThread != null) {
+            mRenderThread.setDisplayRotation(currentDisplayRotation());
             mRenderThread.surfaceChanged(width, height);
         }
     }
@@ -138,6 +165,27 @@ public class Day13Activity extends Activity implements SurfaceHolder.Callback {
     }
 
     @Override
+    public void onDisplayAdded(int displayId) {
+    }
+
+    @Override
+    public void onDisplayRemoved(int displayId) {
+    }
+
+    @Override
+    public void onDisplayChanged(int displayId) {
+        Display display = mPreviewView.getDisplay();
+        if (mRenderThread != null && display != null && display.getDisplayId() == displayId) {
+            mRenderThread.setDisplayRotation(display.getRotation());
+        }
+    }
+
+    private int currentDisplayRotation() {
+        Display display = mPreviewView.getDisplay();
+        return display == null ? Surface.ROTATION_0 : display.getRotation();
+    }
+
+    @Override
     public void onRequestPermissionsResult(
             int requestCode,
             @NonNull String[] permissions,
@@ -147,12 +195,22 @@ public class Day13Activity extends Activity implements SurfaceHolder.Callback {
         if (requestCode == REQUEST_CAMERA && grantResults.length > 0
                 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
             recreate();
+        } else if (requestCode == REQUEST_VIDEO_STORAGE) {
+            showStatus(grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED
+                    ? "存储权限已授予，请点击开始录制"
+                    : "需要存储权限才能保存视频到相册");
         }
+    }
+
+    void showRecordingState(boolean recording, String status) {
+        runOnUiThread(() -> {
+            mRecording = recording;
+            mRecordButton.setText(recording ? "停止录制" : "开始录制");
+            mStatusView.setText(status);
+        });
     }
 
     void showStatus(final String text) {
         runOnUiThread(() -> mStatusView.setText(text));
     }
-
-    /** 在独立线程中拥有 Camera2、EGL、SurfaceTexture 和编码器。 */
 }

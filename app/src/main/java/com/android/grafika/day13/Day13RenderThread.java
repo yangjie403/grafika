@@ -4,7 +4,6 @@ import android.content.Context;
 import android.graphics.SurfaceTexture;
 import android.opengl.GLES20;
 import android.opengl.Matrix;
-import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.Message;
@@ -19,11 +18,7 @@ import com.android.grafika.gles.FullFrameRect;
 import com.android.grafika.gles.Texture2dProgram;
 import com.android.grafika.gles.WindowSurface;
 
-import java.io.File;
 import java.io.IOException;
-import java.text.SimpleDateFormat;
-import java.util.Date;
-import java.util.Locale;
 
 /**
  * Day13 的 EGL/OpenGL 渲染和 MediaCodec 输出线程。
@@ -38,6 +33,7 @@ public final class Day13RenderThread extends Thread
         private static final int MSG_SET_RECORDING = 5;
         private static final int MSG_SWITCH_CAMERA = 6;
         private static final int MSG_SHUTDOWN = 7;
+        private static final int MSG_DISPLAY_ROTATION_CHANGED = 8;
 
         private final Day13Activity mActivity;
         private final Context mContext;
@@ -59,7 +55,7 @@ public final class Day13RenderThread extends Thread
         private SurfaceTexture mCameraTexture;
         private Surface mCameraSurface;
         private final float[] mSurfaceTextureMatrix = new float[16];
-        private final float[] mRotationMatrix = new float[16];
+        private final float[] mDisplayRotationMatrix = new float[16];
         private final float[] mFinalTextureMatrix = new float[16];
 
         private Day13CameraController mCameraController;
@@ -69,19 +65,20 @@ public final class Day13RenderThread extends Thread
         private int mDisplayRotation;
 
         private boolean mFramePending;
-        private boolean mRecording;
+        private boolean mHasSubmittedFrames;
+        private boolean mRecordingFailed;
         private VideoEncoderCore mVideoEncoder;
         private WindowSurface mEncoderWindow;
         private int mEncoderWidth;
         private int mEncoderHeight;
-        private File mOutputFile;
+        private Day13VideoOutput mVideoOutput;
 
-        Day13RenderThread(Day13Activity activity, int lensFacing) {
-        super("Day13-Camera2-GL");
+        Day13RenderThread(Day13Activity activity, int lensFacing, int displayRotation) {
+            super("Day13-Camera2-GL");
             mActivity = activity;
             mContext = activity.getApplicationContext();
             mLensFacing = lensFacing;
-            mDisplayRotation = activity.getWindowManager().getDefaultDisplay().getRotation();
+            mDisplayRotation = displayRotation;
         }
 
         void waitUntilReady() {
@@ -182,6 +179,10 @@ public final class Day13RenderThread extends Thread
             post(MSG_SWITCH_CAMERA, lensFacing);
         }
 
+        void setDisplayRotation(int displayRotation) {
+            post(MSG_DISPLAY_ROTATION_CHANGED, displayRotation);
+        }
+
         void shutdown() {
             post(MSG_SHUTDOWN, null);
         }
@@ -241,6 +242,10 @@ public final class Day13RenderThread extends Thread
                 drawFrame(mCameraTexture.getTimestamp());
             } catch (RuntimeException e) {
                 Log.e(TAG, "处理相机帧失败", e);
+                if (mVideoEncoder != null) {
+                    mRecordingFailed = true;
+                    stopRecording();
+                }
             }
         }
 
@@ -272,12 +277,15 @@ public final class Day13RenderThread extends Thread
                         mEncoderWindow,
                         mEncoderWidth,
                         mEncoderHeight,
-                        mEncoderWidth,
-                        mEncoderHeight,
+                        getDisplaySourceWidth(),
+                        getDisplaySourceHeight(),
                         true
                 );
                 mEncoderWindow.setPresentationTime(timestampNanos);
-                mEncoderWindow.swapBuffers();
+                if (!mEncoderWindow.swapBuffers()) {
+                    throw new IllegalStateException("向编码器提交画面失败");
+                }
+                mHasSubmittedFrames = true;
                 mVideoEncoder.drainEncoder(false);
             }
         }
@@ -328,26 +336,25 @@ public final class Day13RenderThread extends Thread
         }
 
         private void buildTextureMatrix() {
-            int rotation = getCameraToDisplayRotation();
-            Matrix.setIdentityM(mRotationMatrix, 0);
-            Matrix.translateM(mRotationMatrix, 0, 0.5f, 0.5f, 0f);
-            Matrix.rotateM(mRotationMatrix, 0, rotation, 0f, 0f, 1f);
-            if (mFrontCamera) {
-                // 前置预览通常需要镜像，镜像放在旋转之后。
-                Matrix.scaleM(mRotationMatrix, 0, -1f, 1f, 1f);
-            }
-            Matrix.translateM(mRotationMatrix, 0, -0.5f, -0.5f, 0f);
+            // Camera2 的 SurfaceTexture 矩阵已包含传感器旋转和前置镜像，不能重复叠加。
+            // 这里只绕纹理中心补偿屏幕旋转；采样坐标使用显示旋转的负角度。
+            int rotation = -rotationToDegrees(mDisplayRotation);
+            Matrix.setIdentityM(mDisplayRotationMatrix, 0);
+            Matrix.translateM(mDisplayRotationMatrix, 0, 0.5f, 0.5f, 0f);
+            Matrix.rotateM(mDisplayRotationMatrix, 0, rotation, 0f, 0f, 1f);
+            Matrix.translateM(mDisplayRotationMatrix, 0, -0.5f, -0.5f, 0f);
             Matrix.multiplyMM(
                     mFinalTextureMatrix,
                     0,
                     mSurfaceTextureMatrix,
                     0,
-                    mRotationMatrix,
+                    mDisplayRotationMatrix,
                     0
             );
         }
 
         private int getCameraToDisplayRotation() {
+            // 传感器相对屏幕的角度只用于计算显示宽高，不再用于追加纹理旋转。
             int displayDegrees = rotationToDegrees(mDisplayRotation);
             if (mFrontCamera) {
                 return (mSensorOrientation + displayDegrees) % 360;
@@ -384,43 +391,36 @@ public final class Day13RenderThread extends Thread
 
         private void startRecording() {
             if (mCameraSize == null) {
-                mActivity.showStatus("相机尚未准备好");
+                mActivity.showRecordingState(false, "相机尚未准备好");
                 return;
             }
             mEncoderWidth = getDisplaySourceWidth();
             mEncoderHeight = getDisplaySourceHeight();
             mEncoderWidth &= ~1;
             mEncoderHeight &= ~1;
-            File directory = mContext.getExternalFilesDir(Environment.DIRECTORY_MOVIES);
-            if (directory == null) {
-                directory = mContext.getFilesDir();
-            }
-            if (!directory.exists() && !directory.mkdirs()) {
-                mActivity.showStatus("无法创建视频目录");
-                return;
-            }
-            String name = new SimpleDateFormat(
-                    "yyyyMMdd_HHmmss",
-                    Locale.US
-            ).format(new Date());
-            mOutputFile = new File(directory, "activity13_" + name + ".mp4");
+            mHasSubmittedFrames = false;
+            mRecordingFailed = false;
             try {
-                mVideoEncoder = new VideoEncoderCore(
+                mVideoOutput = Day13VideoOutput.create(mContext);
+                mVideoEncoder = mVideoOutput.createEncoder(
                         mEncoderWidth,
                         mEncoderHeight,
-                        4_000_000,
-                        mOutputFile
+                        4_000_000
                 );
                 mEncoderWindow = new WindowSurface(
                         mEglCore,
                         mVideoEncoder.getInputSurface(),
-                        true
+                        false
                 );
-                mActivity.showStatus("录制中");
+                mActivity.showRecordingState(true, "录制中");
             } catch (IOException | RuntimeException e) {
                 Log.e(TAG, "创建视频编码器失败", e);
                 releaseEncoder();
-                mActivity.showStatus("录制启动失败");
+                if (mVideoOutput != null) {
+                    mVideoOutput.discard();
+                    mVideoOutput = null;
+                }
+                mActivity.showRecordingState(false, "录制启动失败");
             }
         }
 
@@ -428,30 +428,66 @@ public final class Day13RenderThread extends Thread
             if (mVideoEncoder == null) {
                 return;
             }
-            try {
-                mVideoEncoder.drainEncoder(true);
-            } catch (RuntimeException e) {
-                Log.e(TAG, "结束编码失败", e);
+            boolean finalized = mHasSubmittedFrames && !mRecordingFailed;
+            if (finalized) {
+                try {
+                    mVideoEncoder.drainEncoder(true);
+                    finalized = mVideoEncoder.hasEncodedFrames();
+                } catch (RuntimeException e) {
+                    Log.e(TAG, "结束编码失败", e);
+                    finalized = false;
+                }
             }
-            releaseEncoder();
-            mActivity.showStatus(mOutputFile == null
-                    ? "已停止"
-                    : "已保存: " + mOutputFile.getName());
+            // MP4 的尾部索引在 MediaMuxer.stop() 时写入，成功封装后才能发布到相册。
+            finalized = releaseEncoder() && finalized;
+            Day13VideoOutput output = mVideoOutput;
+            mVideoOutput = null;
+            if (output == null) {
+                mActivity.showRecordingState(false, "保存失败");
+                return;
+            }
+            if (!finalized) {
+                output.discard();
+                mActivity.showRecordingState(false,
+                        mHasSubmittedFrames ? "录制失败，未保存视频" : "未录制到有效画面");
+                return;
+            }
+            try {
+                output.publish();
+                mActivity.showRecordingState(false, "已保存到相册: " + output.getDisplayName());
+            } catch (IOException | RuntimeException e) {
+                Log.e(TAG, "保存视频到相册失败", e);
+                output.discard();
+                mActivity.showRecordingState(false, "保存到相册失败");
+            }
         }
 
-        private void releaseEncoder() {
+        private boolean releaseEncoder() {
+            boolean success = true;
             if (mEncoderWindow != null) {
-                mEncoderWindow.release();
-                mEncoderWindow = null;
+                try {
+                    mEglCore.makeCurrent(mPbuffer);
+                    mEncoderWindow.release();
+                } catch (RuntimeException e) {
+                    Log.e(TAG, "释放编码器 EGLSurface 失败", e);
+                    success = false;
+                } finally {
+                    mEncoderWindow = null;
+                }
             }
             if (mVideoEncoder != null) {
                 try {
                     mVideoEncoder.release();
                 } catch (RuntimeException e) {
                     Log.e(TAG, "释放视频编码器失败", e);
+                    success = false;
+                } finally {
+                    // 编码器输入 Surface 由本线程持有，连 EGL 窗口创建失败的情况也要释放。
+                    mVideoEncoder.getInputSurface().release();
+                    mVideoEncoder = null;
                 }
-                mVideoEncoder = null;
             }
+            return success;
         }
 
         private void handleSwitchCamera(int lensFacing) {
@@ -567,6 +603,9 @@ public final class Day13RenderThread extends Thread
                         break;
                     case MSG_SWITCH_CAMERA:
                         mThread.handleSwitchCamera((Integer) message.obj);
+                        break;
+                    case MSG_DISPLAY_ROTATION_CHANGED:
+                        mThread.mDisplayRotation = (Integer) message.obj;
                         break;
                     case MSG_SHUTDOWN:
                         mThread.mDone = true;
